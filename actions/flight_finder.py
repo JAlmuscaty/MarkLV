@@ -6,6 +6,8 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from core.drive_scope import save_dir
+
 from config import is_windows, is_mac, is_linux
 
 def _get_base_dir() -> Path:
@@ -273,8 +275,7 @@ def _format_text_report(
 def _save_to_desktop(content: str, origin: str, destination: str) -> str:
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"flights_{origin}_{destination}_{ts}.txt".replace(" ", "_")
-    desktop  = Path.home() / "Desktop"
-    desktop.mkdir(parents=True, exist_ok=True)
+    desktop  = save_dir()
     filepath = desktop / filename
 
     filepath.write_text(content, encoding="utf-8")
@@ -350,7 +351,7 @@ def flight_finder(parameters: dict, player=None, speak=None) -> str:
         if save and flights:
             report     = _format_text_report(flights, origin, destination, date, return_date, page_url)
             saved_path = _save_to_desktop(report, origin, destination)
-            result    += f" Results saved to Desktop: {saved_path}"
+            result    += f" Results saved to: {saved_path}"
 
         return result
 

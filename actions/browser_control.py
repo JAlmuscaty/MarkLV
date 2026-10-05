@@ -12,6 +12,8 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
+from core.drive_scope import denial, is_allowed, save_dir
+
 from playwright.async_api import (
     async_playwright,
     BrowserContext,
@@ -56,6 +58,13 @@ def _user_agent() -> str:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
+
+
+def _jarvis_profile(name: str) -> Path:
+    """Browser profile stored on D:, never in the Windows user folder on C:."""
+    folder = save_dir() / "browser" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def _real_profile_dir(browser: str) -> str:
@@ -103,13 +112,12 @@ def _real_profile_dir(browser: str) -> str:
         candidates = m.get(browser, [])
 
     for p in candidates:
-        if p.exists():
+        if p.exists() and is_allowed(p):
             print(f"[Browser] ✅ Real profile found for {browser}: {p}")
             return str(p)
 
-    fallback = home / ".jarvis_profiles" / browser
-    fallback.mkdir(parents=True, exist_ok=True)
-    print(f"[Browser] ⚠️  Real profile not found for {browser}, using: {fallback}")
+    fallback = _jarvis_profile(browser)
+    print(f"[Browser] Using profile on {fallback}")
     return str(fallback)
 
 def _firefox_profile_dir() -> Optional[str]:
@@ -123,7 +131,7 @@ def _firefox_profile_dir() -> Optional[str]:
         base = home / ".mozilla" / "firefox"
 
     ini = base / "profiles.ini"
-    if not ini.exists():
+    if not ini.exists() or not is_allowed(ini):
         return None
 
     current: dict[str, str] = {}
@@ -532,9 +540,7 @@ class _BrowserSession:
         engine_obj  = getattr(self._pw, engine_name)
 
         if engine_name == "firefox":
-            profile = _firefox_profile_dir() or str(
-                Path.home() / ".jarvis_profiles" / "firefox"
-            )
+            profile = _firefox_profile_dir() or str(_jarvis_profile("firefox"))
             kwargs: dict = {
                 "headless":    False,
                 "slow_mo":     0,
@@ -548,8 +554,7 @@ class _BrowserSession:
                 self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
             except Exception as e:
                 print(f"[Browser] Firefox real profile failed ({e}), using JARVIS profile")
-                jarvis = str(Path.home() / ".jarvis_profiles" / "firefox_jarvis")
-                Path(jarvis).mkdir(parents=True, exist_ok=True)
+                jarvis = str(_jarvis_profile("firefox_jarvis"))
                 self._context = await engine_obj.launch_persistent_context(jarvis, **kwargs)
 
             self._page = await self._adopt_page()
@@ -557,8 +562,7 @@ class _BrowserSession:
             return
 
         if engine_name == "webkit":
-            safari_profile = str(Path.home() / ".jarvis_profiles" / "safari")
-            Path(safari_profile).mkdir(parents=True, exist_ok=True)
+            safari_profile = str(_jarvis_profile("safari"))
             kwargs = {
                 "headless":    False,
                 "slow_mo":     0,
@@ -611,8 +615,7 @@ class _BrowserSession:
         # profile / newer Chrome versions block the real profile under
         # automation). Fall back to a persistent JARVIS automation profile —
         # accounts logged in here once stay logged in on later sessions too.
-        jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
-        Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
+        jarvis_profile = str(_jarvis_profile(self.browser_name))
         print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
 
         try:
@@ -626,10 +629,21 @@ class _BrowserSession:
 
     async def _get_page(self) -> Page:
         await self._launch()
-        # If somehow page got closed, open a fresh one
-        if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
-            await asyncio.sleep(0.2)
+        # The tracked tab is the one Jarvis opened. The user often closes that
+        # tab and continues in another one — including a different Google
+        # account. Use a tab that is still open before creating a blank page.
+        pages = [p for p in (self._context.pages if self._context else []) if not p.is_closed()]
+        if self._page is not None and not self._page.is_closed():
+            return self._page
+        if pages:
+            self._page = pages[-1]
+            for page in pages:
+                if "classroom.google" in (page.url or ""):
+                    self._page = page
+                    break
+            return self._page
+        self._page = await self._context.new_page()
+        await asyncio.sleep(0.2)
         return self._page
 
     async def go_to(self, url: str) -> str:
@@ -805,7 +819,9 @@ class _BrowserSession:
     async def screenshot(self, path: str = None) -> str:
         page = await self._get_page()
         try:
-            save_path = path or str(Path.home() / "Desktop" / "jarvis_screenshot.png")
+            save_path = path or str(save_dir() / "jarvis_screenshot.png")
+            if not is_allowed(save_path):
+                return denial(save_path)
             await page.screenshot(path=save_path, full_page=False)
             return f"Screenshot saved: {save_path}"
         except Exception as e:
@@ -848,6 +864,22 @@ class _SessionRegistry:
         self._lock             = threading.Lock()
         self._last_native_url: str                        = ""
 
+    def page_is_open(self, browser_name: str | None = None) -> bool:
+        """True when Jarvis still has its own tab. A tab the user closed is not open."""
+        with self._lock:
+            if browser_name:
+                name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+            else:
+                name = self._active_browser
+            sess = self._sessions.get(name) if name else None
+            page = getattr(sess, "_page", None) if sess else None
+            if page is None:
+                return False
+            try:
+                return not page.is_closed()
+            except Exception:
+                return False
+
     def has(self, browser_name: str | None = None) -> bool:
         """Is there an active automation session for this browser (or any)?"""
         with self._lock:
@@ -858,6 +890,9 @@ class _SessionRegistry:
 
     def note_native_url(self, url: str) -> None:
         self._last_native_url = url
+
+    def peek_native_url(self) -> str:
+        return self._last_native_url
 
     def pop_native_url(self) -> str:
         """Returns the last natively-opened URL once (consumed to avoid repeats)."""
@@ -919,6 +954,152 @@ class _SessionRegistry:
                 marker = " ◀ active" if name == self._active_browser else ""
                 lines.append(f"  • {name}{marker}")
             return "Open browsers:\n" + "\n".join(lines)
+
+
+_CLASSROOM_WORDS = ("classroom", "sınıf", "sinif")
+_BROWSER_CLASSES = {
+    "Chrome_WidgetWin_1",
+    "MozillaWindowClass",
+    "ApplicationFrameWindow",
+}
+
+
+def _site_needles(hint: str) -> list[str]:
+    """Title words for the site the user wants read. Empty means 'whatever is open'."""
+    text = (hint or "").lower()
+    if not text:
+        return []
+    if "classroom.google" in text or any(word in text for word in _CLASSROOM_WORDS):
+        return list(_CLASSROOM_WORDS)
+    host = text.split("://", 1)[-1].split("/", 1)[0]
+    token = host.split(".")[0]
+    if token and token not in ("www", "google", "com"):
+        return [token]
+    return []
+
+
+def _browser_windows() -> list[tuple[int, str]]:
+    """Visible browser windows, front-most first. Windows only; other OSes get none."""
+    if _OS != "Windows":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found: list[tuple[int, str]] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def _each(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        if cls.value not in _BROWSER_CLASSES:
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, length + 1)
+        if title.value:
+            found.append((int(hwnd), title.value))
+        return True
+
+    user32.EnumWindows(_each, 0)
+    return found
+
+
+def _capture_window(hwnd: int):
+    """Bring a window forward and grab its pixels. Returns a PIL image or None."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.keybd_event(0x12, 0, 0, 0)
+    user32.SetForegroundWindow(hwnd)
+    user32.keybd_event(0x12, 0, 2, 0)
+    time.sleep(0.45)
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    if rect.right - rect.left < 80 or rect.bottom - rect.top < 80:
+        return None
+    try:
+        from PIL import ImageGrab
+        box = (rect.left, rect.top, rect.right, rect.bottom)
+        try:
+            return ImageGrab.grab(bbox=box, all_screens=True)
+        except TypeError:
+            return ImageGrab.grab(bbox=box)
+    except Exception as e:
+        print(f"[Browser] Could not capture the open window: {e}")
+        return None
+
+
+def _read_window_image(image, title: str) -> str:
+    """Ask Gemini what the open browser window shows. The picture is not kept."""
+    import io
+
+    from google.genai import types
+
+    from core import gemini
+
+    image.thumbnail((1280, 800))
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG", quality=80)
+    part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+    prompt = (
+        "Read this browser window. The window title is: "
+        f"{title}. "
+        "If it is Google Classroom, list the classes, assignments and due dates "
+        "that are visible, and the account name if it is shown. "
+        "If it is a login page or an error, say that. "
+        "Do not say the tab is closed."
+    )
+    reply = gemini.call([prompt, part], tier=gemini.SMART, timeout_ms=45_000)
+    text = (getattr(reply, "text", None) or "").strip()
+    if not text:
+        return f"Google Classroom is open ({title}), but the page could not be read."
+    return f"Read from the open browser window ({title}):\n{text}"
+
+
+def _read_existing_browser(hint: str) -> str | None:
+    """Read a browser window the user already has open, instead of Jarvis's own tab.
+
+    Jarvis opens Classroom in its own profile, which is often the wrong account.
+    The user then closes that tab and uses their own. The page they are looking
+    at is the one to read.
+    """
+    needles = _site_needles(hint)
+    windows = _browser_windows()
+    if not windows:
+        return None
+    if needles:
+        matches = [
+            (hwnd, title) for hwnd, title in windows
+            if any(word in title.lower() for word in needles)
+        ]
+    elif not (hint or "").strip():
+        # No site was named and Jarvis's own tab is gone. Classroom is the
+        # page this failure was reported for, so an open Classroom window counts.
+        matches = [
+            (hwnd, title) for hwnd, title in windows
+            if any(word in title.lower() for word in _CLASSROOM_WORDS)
+        ]
+    else:
+        matches = []
+    if not matches:
+        return None
+    hwnd, title = matches[0]
+    image = _capture_window(hwnd)
+    if image is None:
+        return f"The page is open ({title}). It could not be captured."
+    try:
+        return _read_window_image(image, title)
+    except Exception as e:
+        print(f"[Browser] Reading the open window failed: {e}")
+        return f"The page is open ({title}). Reading it failed: {e}"
 
 
 _registry = _SessionRegistry()
@@ -993,6 +1174,18 @@ def browser_control(
         _log(player, result)
         return result
 
+    # Reading must use the window the user is actually looking at. Closing the
+    # tab Jarvis opened, or having Classroom open already, is not "the tab is
+    # closed" — their own browser still has the page.
+    if action == "get_text":
+        hint = (params.get("url") or "").strip() or _registry.peek_native_url()
+        # A known site, or a closed Jarvis tab: read the window the user has open.
+        if hint or not _registry.page_is_open(browser):
+            existing = _read_existing_browser(hint)
+            if existing:
+                _log(player, existing)
+                return existing
+
     # ── Interactive actions (click/type/read…) ───────────────────────────────
     # These require a physically controllable browser; the automation window
     # only opens here, and as soon as it opens it goes to the user's last
@@ -1063,7 +1256,7 @@ def _log(player, text: str):
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "browser_control",
-    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously.",
+    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously. To check a page the user already has open, or that they reopened in their own account after closing your tab, call get_text and pass that page's url. Do not say the tab is closed and do not refuse to look. Google Classroom is read from the Classroom window they have open.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -1077,7 +1270,7 @@ TOOL = {
             },
             "url": {
                 "type": "STRING",
-                "description": "URL for go_to / new_tab action"
+                "description": "URL for go_to / new_tab, and for get_text when the user already has that site open (for example https://classroom.google.com)."
             },
             "query": {
                 "type": "STRING",

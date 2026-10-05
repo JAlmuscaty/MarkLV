@@ -485,7 +485,7 @@ def open_system_settings():
 
 def open_file_explorer():
     if _OS == "Windows":
-        pyautogui.hotkey("win", "e")
+        subprocess.Popen(["explorer.exe", "D:\\"])
     elif _OS == "Darwin":
         subprocess.Popen(["open", str(Path.home())])
     else:

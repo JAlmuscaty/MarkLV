@@ -5,6 +5,8 @@ import re
 import time
 from pathlib import Path
 
+from core.drive_scope import denial, is_allowed, root
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -14,13 +16,25 @@ def get_base_dir():
 
 BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
-PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
+PROJECTS_DIR     = root() / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
 # Model choice, timeout and fallback ladder all live in core/gemini.py.
 from core import gemini
 
 MODEL_PLANNER    = gemini.SMART
 MODEL_WRITER     = gemini.SMART
+
+def _project_file(project_dir: Path, relative: str) -> Path:
+    """A file inside the project, refused when the path escapes onto another drive."""
+    relative_path = Path(relative)
+    if relative_path.is_absolute():
+        raise PermissionError(denial(relative_path))
+    full = (project_dir / relative_path).resolve()
+    base = project_dir.resolve()
+    if not is_allowed(full) or not full.is_relative_to(base):
+        raise PermissionError(denial(full))
+    return full
+
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -227,7 +241,7 @@ Code for {file_path}:"""
         response = model.generate_content(prompt)
         code = _strip_fences(response.text)
 
-        full_path = project_dir / file_path
+        full_path = _project_file(project_dir, file_path)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(code, encoding="utf-8")
 
@@ -425,7 +439,7 @@ Fixed code for {fix_path}:"""
             response = model.generate_content(prompt)
             fixed = _strip_fences(response.text)
 
-            full_path = project_dir / fix_path
+            full_path = _project_file(project_dir, fix_path)
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(fixed, encoding="utf-8")
 
@@ -468,6 +482,8 @@ def _build_project(
     proj_name    = project_name or plan.get("project_name", "jarvis_project")
     proj_name    = re.sub(r"[^\w\-]", "_", proj_name)
     project_dir  = PROJECTS_DIR / proj_name
+    if not is_allowed(project_dir):
+        return denial(project_dir)
     project_dir.mkdir(parents=True, exist_ok=True)
 
     files        = plan.get("files", [])

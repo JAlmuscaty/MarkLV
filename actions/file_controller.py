@@ -1,4 +1,3 @@
-import os
 import shutil
 import platform
 from pathlib import Path
@@ -11,6 +10,7 @@ except ImportError:
     _SEND2TRASH = False
 
 from core.undo import push_undo
+from core.drive_scope import ALLOWED_DRIVE, denial, is_allowed, root, shortcut
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -90,78 +90,50 @@ def _restore_from_trash(original: Path) -> str:
             f"automatically, but it is there and can be restored by hand.")
 
 
-_SAFE_ROOTS: list[Path] = [
-    Path.home(),
-]
-
 def _is_safe_path(target: Path) -> bool:
-    """Is the given path inside _SAFE_ROOTS? If not, reject the operation."""
-    try:
-        resolved = target.resolve()
-        return any(
-            resolved == root.resolve() or resolved.is_relative_to(root.resolve())
-            for root in _SAFE_ROOTS
+    """True only when the path stays on D: after links are resolved."""
+    return is_allowed(target)
+
+
+def _deny(target: Path) -> str:
+    return denial(target)
+
+
+def _named_folder(name: str) -> Path:
+    found = shortcut(name)
+    if found is None:
+        raise PermissionError(
+            f"'{name}' is not on the {ALLOWED_DRIVE}: drive. "
+            f"Give a path on {ALLOWED_DRIVE}: instead."
         )
-    except Exception:
-        return False
+    return found
 
-def _get_desktop() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DESKTOP_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Desktop"
 
-def _get_downloads() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOWNLOAD_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Downloads"
+def _get_desktop() -> Path | None:
+    return shortcut("desktop")
 
-def _get_documents() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOCUMENTS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Documents"
+def _get_downloads() -> Path | None:
+    return shortcut("downloads")
 
-def _get_pictures() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_PICTURES_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Pictures"
+def _get_documents() -> Path | None:
+    return shortcut("documents")
 
-def _get_music() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_MUSIC_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Music"
+def _get_pictures() -> Path | None:
+    return shortcut("pictures")
 
-def _get_videos() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_VIDEOS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Videos"
+def _get_music() -> Path | None:
+    return shortcut("music")
+
+def _get_videos() -> Path | None:
+    return shortcut("videos")
 
 
 def _resolve_path(raw: str) -> Path:
-    shortcuts: dict[str, Path] = {
-        "desktop":   _get_desktop(),
-        "downloads": _get_downloads(),
-        "documents": _get_documents(),
-        "pictures":  _get_pictures(),
-        "music":     _get_music(),
-        "videos":    _get_videos(),
-        "home":      Path.home(),
-    }
+    names = ("desktop", "downloads", "documents", "pictures", "music", "videos", "home")
     raw   = raw.strip().strip('"').strip("'")
     lower = raw.lower()
-    if lower in shortcuts:
-        return shortcuts[lower]
+    if lower in names:
+        return _named_folder(lower)
 
     # "desktop/notes/a.md" and "desktop\notes\a.md" — a shortcut followed by a
     # sub-path.  Without this branch the whole string falls through to the
@@ -170,9 +142,10 @@ def _resolve_path(raw: str) -> Path:
     # home directory, or — worse — a silent write into a stray "desktop" folder
     # inside the project when it lives inside it.
     head, sep, rest = raw.replace("\\", "/").partition("/")
-    if sep and head.lower() in shortcuts:
+    if sep and head.lower() in names:
+        base = _named_folder(head.lower())
         rest = rest.strip("/")
-        return shortcuts[head.lower()] / rest if rest else shortcuts[head.lower()]
+        return base / rest if rest else base
 
     return Path(raw).expanduser()
 
@@ -199,7 +172,7 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
     try:
         target = _resolve_path(path)
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return _deny(target)
         if not target.exists():
             return f"Path not found: {target}"
         if not target.is_dir():
@@ -220,8 +193,8 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
 
         return f"Contents of {target.name}/ ({len(items)} items):\n" + "\n".join(items)
 
-    except PermissionError:
-        return f"Permission denied: {path}"
+    except PermissionError as e:
+        return str(e) or f"Permission denied: {path}"
     except Exception as e:
         return f"Error listing files: {e}"
 
@@ -231,7 +204,7 @@ def create_file(path: str, name: str = "", content: str = "") -> str:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return _deny(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         existed = target.exists()
         previous = None
@@ -253,7 +226,7 @@ def create_folder(path: str, name: str = "") -> str:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return _deny(target)
         already = target.exists()
         target.mkdir(parents=True, exist_ok=True)
         # Only offer to undo a folder we actually made. "mkdir -p" on something
@@ -271,15 +244,18 @@ def delete_file(path: str, name: str = "") -> str:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return _deny(target)
         if not target.exists():
             return f"Not found: {target.name}"
 
-        # Safe-directory check — protect critical user folders
-        protected = {
+        # Refuse to delete the drive root or a known folder itself.
+        protected = {root()}
+        for folder in (
             _get_desktop(), _get_downloads(), _get_documents(),
-            _get_pictures(), _get_music(), _get_videos(), Path.home()
-        }
+            _get_pictures(), _get_music(), _get_videos(),
+        ):
+            if folder is not None:
+                protected.add(folder)
         if target.resolve() in {p.resolve() for p in protected}:
             return f"Protected directory, cannot delete: {target.name}"
 
@@ -290,8 +266,8 @@ def delete_file(path: str, name: str = "") -> str:
                       lambda p=original: _restore_from_trash(p))
         return result
 
-    except PermissionError:
-        return f"Permission denied: {path}"
+    except PermissionError as e:
+        return str(e) or f"Permission denied: {path}"
     except Exception as e:
         return f"Could not delete: {e}"
 
@@ -307,9 +283,9 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
         if dst is None:
             return "No destination specified."
         if not _is_safe_path(src):
-            return f"Access denied (source): {src}"
+            return _deny(src)
         if not _is_safe_path(dst):
-            return f"Access denied (destination): {dst}"
+            return _deny(dst)
 
         if dst.is_dir():
             dst = dst / src.name
@@ -336,9 +312,9 @@ def copy_file(path: str, name: str = "", destination: str = "") -> str:
         if dst is None:
             return "No destination specified."
         if not _is_safe_path(src):
-            return f"Access denied (source): {src}"
+            return _deny(src)
         if not _is_safe_path(dst):
-            return f"Access denied (destination): {dst}"
+            return _deny(dst)
 
         if dst.is_dir():
             dst = dst / src.name
@@ -373,7 +349,7 @@ def rename_file(path: str, name: str = "", new_name: str = "") -> str:
         base     = _resolve_path(path)
         target   = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return _deny(target)
         if not target.exists():
             return f"Not found: {target.name}"
         if not new_name:
@@ -398,7 +374,7 @@ def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return _deny(target)
         if not target.exists():
             return f"File not found: {target.name}"
         if not target.is_file():
@@ -419,7 +395,7 @@ def write_file(path: str, name: str = "", content: str = "",
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return _deny(target)
         target.parent.mkdir(parents=True, exist_ok=True)
 
         # Snapshot before writing. None means "did not exist", which is a
@@ -455,7 +431,7 @@ def find_files(name: str = "", extension: str = "",
     try:
         search_path = _resolve_path(path)
         if not _is_safe_path(search_path):
-            return f"Access denied: {search_path}"
+            return _deny(search_path)
         if not search_path.exists():
             return f"Search path not found: {path}"
 
@@ -495,7 +471,7 @@ def get_largest_files(path: str = "downloads", count: int = 10) -> str:
     try:
         search_path = _resolve_path(path)
         if not _is_safe_path(search_path):
-            return f"Access denied: {search_path}"
+            return _deny(search_path)
         if not search_path.exists():
             return f"Path not found: {path}"
 
@@ -526,6 +502,8 @@ def get_largest_files(path: str = "downloads", count: int = 10) -> str:
 def get_disk_usage(path: str = "home") -> str:
     try:
         target = _resolve_path(path)
+        if not _is_safe_path(target):
+            return _deny(target)
         usage  = shutil.disk_usage(target)
         pct    = usage.used / usage.total * 100
         return (
@@ -551,6 +529,11 @@ def organize_desktop() -> str:
     }
 
     desktop = _get_desktop()
+    if desktop is None:
+        return (
+            f"The desktop folder is not on the {ALLOWED_DRIVE}: drive, "
+            f"so it cannot be organized."
+        )
     moved, skipped = [], []
     journal: list[tuple[Path, Path]] = []   # (where it was, where it went)
 
@@ -626,7 +609,7 @@ def get_file_info(path: str, name: str = "") -> str:
         base   = _resolve_path(path)
         target = (base / name) if name else base
         if not _is_safe_path(target):
-            return f"Access denied: {target}"
+            return _deny(target)
         if not target.exists():
             return f"Not found: {target.name}"
 
@@ -724,7 +707,7 @@ def file_controller(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
-    "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+            "description": "Manages files and folders on the D: drive only: list, create, delete, move, copy, rename, read, write, find, disk usage. Paths on C: or any other drive are refused.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -734,7 +717,7 @@ TOOL = {
             },
             "path": {
                 "type": "STRING",
-                "description": "File/folder path or shortcut: desktop, downloads, documents, home"
+                "description": "Path on the D: drive. Shortcuts desktop, downloads, documents, pictures, music, videos work only when that folder is on D:. home means D:\\"
             },
             "destination": {
                 "type": "STRING",

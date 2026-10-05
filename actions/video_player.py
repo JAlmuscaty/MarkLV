@@ -29,6 +29,8 @@ import threading
 import webbrowser
 from pathlib import Path
 
+from core.drive_scope import denial, is_allowed, looks_like_filesystem
+
 _YT = re.compile(r"(youtube\.com/|youtu\.be/)", re.I)
 
 # Which open request is the current one. Opening happens on a thread now, so
@@ -199,8 +201,21 @@ def video_player(parameters: dict = None, response=None, player=None,
     if not source:
         return "What should I play?"
 
+    if looks_like_filesystem(source) and not is_allowed(source):
+        return denial(source)
+
+    if source.lower().startswith("file:"):
+        from urllib.parse import unquote, urlparse
+        parsed = unquote(urlparse(source).path)
+        if len(parsed) > 2 and parsed[0] == "/" and parsed[2] == ":":
+            parsed = parsed[1:]
+        if not is_allowed(parsed):
+            return denial(parsed)
+
     local = _local_path(source)
     if local:
+        if not is_allowed(local):
+            return denial(local)
         player.show_video(local, Path(local).name, muted=True)
         return f"Playing {Path(local).name} on the display, muted."
 

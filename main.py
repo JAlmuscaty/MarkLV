@@ -262,6 +262,10 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
         "devices, accounts or hardware except through the tools listed above.",
         "- You remember what is in the memory block and what has been said this "
         "session. Anything else you were told before is gone unless it was saved.",
+        "- Files and folders are limited to the D: drive. A path on C: or any "
+        "other drive is refused, including Desktop, Documents and Downloads "
+        "when those folders live on C:. Use a path on D: instead. Opening an "
+        "application by name is separate from reading its files.",
     ]
     if has_vision:
         out.append(
@@ -2079,17 +2083,21 @@ class JarvisLive:
         # for host-API enumeration on the Qt thread.
         audio_devices.prefetch()
 
-        # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
-        try:
-            from dashboard.server import DashboardServer
-            self._dashboard = DashboardServer()
+        # The phone server may already be running from _boot(), before the API
+        # key is entered. Start it here only when that did not happen.
+        if self._dashboard is None:
+            try:
+                from dashboard.server import DashboardServer
+                self._dashboard = DashboardServer()
+                self._dashboard.set_connect_callback(self._on_phone_connected)
+                asyncio.create_task(self._dashboard.serve())
+                asyncio.create_task(self._process_dashboard_commands())
+            except Exception as e:
+                print(f"[Dashboard] Disabled: {e}")
+                self._dashboard = None
+        else:
             self._dashboard.set_connect_callback(self._on_phone_connected)
-            asyncio.create_task(self._dashboard.serve())
-            # Runs for the whole lifetime, not just inside an active session
             asyncio.create_task(self._process_dashboard_commands())
-        except Exception as e:
-            print(f"[Dashboard] Disabled: {e}")
-            self._dashboard = None
 
         while True:
             try:
@@ -2304,14 +2312,35 @@ class JarvisLive:
             print(f"[JARVIS] Reconnecting in {delay}s...")
             await asyncio.sleep(delay)
 
+async def _boot(ui):
+    """Open the phone server before the API key is entered.
+
+    The conversation still waits for the key. The phone link and Earth view
+    do not, so both exist while the setup screen is on screen.
+    """
+    dashboard = None
+    try:
+        from dashboard.server import DashboardServer
+        dashboard = DashboardServer()
+        asyncio.create_task(dashboard.serve())
+    except Exception as e:
+        print(f"[Dashboard] Disabled: {e}")
+
+    while not ui._win._ready:
+        await asyncio.sleep(0.4)
+
+    jarvis = JarvisLive(ui)
+    if dashboard is not None:
+        jarvis._dashboard = dashboard
+    await jarvis.run()
+
+
 def main():
     ui = JarvisUI("face.png")
 
     def runner():
-        ui.wait_for_api_key()
-        jarvis = JarvisLive(ui)
         try:
-            asyncio.run(jarvis.run())
+            asyncio.run(_boot(ui))
         except KeyboardInterrupt:
             print("\n🔴 Shutting down...")
 

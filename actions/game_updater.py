@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime
 
 from config import get_os, is_windows, is_mac, is_linux
+from core.drive_scope import ALLOWED_DRIVE, is_allowed
 
 _CNW: dict = (
     {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -78,18 +79,18 @@ def _find_steam_windows() -> Path | None:
                 val, _ = winreg.QueryValueEx(key, "InstallPath")
                 winreg.CloseKey(key)
                 p = Path(val)
-                if p.exists() and (p / "steam.exe").exists():
+                if p.exists() and (p / "steam.exe").exists() and is_allowed(p):
                     return p
             except Exception:
                 continue
     except ImportError:
         pass
     for p in [
-        Path(os.environ.get("ProgramFiles(x86)", "")) / "Steam",
-        Path(os.environ.get("ProgramFiles", ""))       / "Steam",
-        Path("C:/Steam"), Path("D:/Steam"), Path("E:/Steam"), Path("F:/Steam"),
+        Path(f"{ALLOWED_DRIVE}:/Steam"),
+        Path(f"{ALLOWED_DRIVE}:/SteamLibrary"),
+        Path(f"{ALLOWED_DRIVE}:/Games/Steam"),
     ]:
-        if p.exists() and (p / "steam.exe").exists():
+        if p.exists() and (p / "steam.exe").exists() and is_allowed(p):
             return p
     return None
 
@@ -132,15 +133,20 @@ def _launch_steam_url(exe: Path, url: str) -> None:
         subprocess.Popen([str(exe), url])
 
 def _get_steam_libraries(steam_path: Path) -> list[Path]:
-    libraries = [steam_path / "steamapps"]
+    if not is_allowed(steam_path):
+        return []
+    libraries = []
+    primary = steam_path / "steamapps"
+    if is_allowed(primary):
+        libraries.append(primary)
     vdf_path  = steam_path / "steamapps" / "libraryfolders.vdf"
-    if not vdf_path.exists():
+    if not vdf_path.exists() or not is_allowed(vdf_path):
         return libraries
     try:
         content = vdf_path.read_text(encoding="utf-8", errors="ignore")
         for raw_path in re.findall(r'"path"\s+"([^"]+)"', content):
             lib = Path(raw_path.replace("\\\\", "/")) / "steamapps"
-            if lib.exists() and lib not in libraries:
+            if lib.exists() and lib not in libraries and is_allowed(lib):
                 libraries.append(lib)
     except Exception:
         pass
@@ -277,9 +283,9 @@ def _handle_steam_profile_selection() -> bool:
     return _click_first_profile_by_screenshot()
 
 def _find_best_drive() -> dict | None:
-    import shutil, string
+    import shutil
     drives = []
-    for letter in string.ascii_uppercase:
+    for letter in (ALLOWED_DRIVE,):
         drive_path = f"{letter}:\\"
         if os.path.exists(drive_path):
             try:
@@ -687,7 +693,7 @@ def _find_epic_exe_windows() -> Path | None:
                 val, _ = winreg.QueryValueEx(key, "AppDataPath")
                 winreg.CloseKey(key)
                 exe = Path(val) / "Binaries" / "Win64" / "EpicGamesLauncher.exe"
-                if exe.exists():
+                if exe.exists() and is_allowed(exe):
                     return exe
             except Exception:
                 continue
@@ -698,7 +704,7 @@ def _find_epic_exe_windows() -> Path | None:
         Path(os.environ.get("ProgramFiles", ""))       / "Epic Games" / "Launcher" / "Portal" / "Binaries" / "Win64" / "EpicGamesLauncher.exe",
         Path(os.environ.get("LOCALAPPDATA", ""))        / "EpicGamesLauncher" / "Portal" / "Binaries" / "Win64" / "EpicGamesLauncher.exe",
     ]:
-        if candidate.exists():
+        if candidate.exists() and is_allowed(candidate):
             return candidate
     return None
 
@@ -719,7 +725,7 @@ def _epic_manifests_path() -> Path | None:
     if is_windows():
         p = Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) \
             / "Epic" / "EpicGamesLauncher" / "Data" / "Manifests"
-        return p if p.exists() else None
+        return p if p.exists() and is_allowed(p) else None
     if is_mac():
         p = Path.home() / "Library" / "Application Support" \
             / "Epic" / "EpicGamesLauncher" / "Data" / "Manifests"

@@ -11,6 +11,8 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import hmac
+import json
 import re
 import secrets
 import socket
@@ -38,14 +40,20 @@ except Exception:
 BASE_DIR    = Path(__file__).resolve().parent.parent
 STATIC_DIR  = Path(__file__).parent / "static"
 PORT        = 8000
+LOCAL_PORT  = 8002   # plain HTTP on this machine only; the phone tunnel uses it
 MAX_UPLOAD_MB = 500
+_TUNNEL_RE  = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+_WORDS = (
+    "amber birch cedar delta ember flint grove harbor ivy juniper "
+    "kiln lunar maple north orbit pine quartz river stone timber umber violet willow"
+).split()
 
 
 def _make_uploads_dir() -> Path:
-    """Return (and create) the cross-platform uploads folder."""
+    """Uploads stay on D:. The Windows profile folders are on C: and are not used."""
+    from core.drive_scope import save_dir
     for candidate in [
-        Path.home() / "Downloads" / "JARVIS Uploads",
-        Path.home() / "Documents" / "JARVIS Uploads",
+        save_dir() / "Uploads",
         BASE_DIR / "uploads",
     ]:
         try:
@@ -451,6 +459,100 @@ def _read(name: str) -> str:
     return (STATIC_DIR / name).read_text(encoding="utf-8")
 
 
+def _phone_dir() -> Path:
+    from core.drive_scope import save_dir
+    folder = save_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _load_phone_password() -> str:
+    """Standing phone password. Created once and kept in D:\\Jarvis, outside the repo."""
+    path = _phone_dir() / "phone_password.json"
+    if path.exists():
+        try:
+            saved = str(json.loads(path.read_text(encoding="utf-8")).get("password") or "")
+            if len(saved) >= 8:
+                return saved
+        except Exception:
+            pass
+    password = f"{secrets.choice(_WORDS)}-{secrets.choice(_WORDS)}-{secrets.randbelow(90) + 10}"
+    path.write_text(json.dumps({"password": password}), encoding="utf-8")
+    return password
+
+
+def _write_phone_access(password: str, public_url: str, lan_url: str) -> None:
+    lines = [
+        "JARVIS phone access",
+        "",
+        f"Password: {password}",
+        "",
+    ]
+    if public_url:
+        lines.append(f"Away from home: {public_url}")
+        lines.append("Open that link, enter the password, then type, talk, or upload a file.")
+    else:
+        lines.append("Away from home: the link appears here once Jarvis is running.")
+    lines.append("")
+    lines.append(f"Same Wi-Fi: {lan_url}")
+    lines.append("")
+    (_phone_dir() / "phone_access.txt").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _fetch_json(url: str, timeout: float = 15):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "JarvisEarth/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _plane_snapshot() -> list[dict]:
+    data = _fetch_json("https://opensky-network.org/api/states/all")
+    valid = [
+        state for state in (data.get("states") or [])
+        if state[5] is not None and state[6] is not None
+    ]
+    step = max(1, len(valid) // 400)
+    picked = valid[::step][:400]
+    return [
+        {
+            "call": (state[1] or "").strip() or "plane",
+            "lat": state[6],
+            "lon": state[5],
+            "alt": state[7] or 0,
+            "hdg": state[10] or 0,
+        }
+        for state in picked
+    ]
+
+
+def _iss_snapshot() -> dict:
+    data = _fetch_json("https://api.wheretheiss.at/v1/satellites/25544")
+    return {
+        "lat": data.get("latitude"),
+        "lon": data.get("longitude"),
+        "alt": data.get("altitude"),
+        "vel": data.get("velocity"),
+    }
+
+
+def _quake_snapshot() -> list[dict]:
+    data = _fetch_json(
+        "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson"
+    )
+    out = []
+    for feature in (data.get("features") or [])[:80]:
+        lon, lat = feature["geometry"]["coordinates"][:2]
+        props = feature.get("properties") or {}
+        out.append({
+            "lat": lat,
+            "lon": lon,
+            "mag": props.get("mag"),
+            "place": props.get("place") or "",
+        })
+    return out
+
+
 # ── DashboardServer ───────────────────────────────────────────────────────────
 
 class DashboardServer:
@@ -469,6 +571,9 @@ class DashboardServer:
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
+        self._phone_password              = _load_phone_password()
+        self._public_url                  = ""
+        self._login_failures: dict[str, tuple[int, float]] = {}
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
         self.app                          = self._build_app()
@@ -565,24 +670,55 @@ class DashboardServer:
                     .replace("__PORT__", str(PORT)))
             return HTMLResponse(html)
 
+        def _client_ip(req: Request) -> str:
+            return (req.client.host if req.client else "") or "?"
+
+        def _login_locked(ip: str) -> bool:
+            count, until = self._login_failures.get(ip, (0, 0.0))
+            return count >= 8 and until > time.time()
+
+        def _login_fail(ip: str) -> None:
+            count, until = self._login_failures.get(ip, (0, 0.0))
+            if until <= time.time():
+                count = 0
+            count += 1
+            self._login_failures[ip] = (count, time.time() + 60 if count >= 8 else 0.0)
+
+        def _open_session(session_key: str, device: bool = False) -> dict:
+            tok = secrets.token_urlsafe(32)
+            self._tokens.add(tok)
+            self._token_keys[tok] = session_key
+            self._aes_key(session_key)
+            body = {"ok": True, "token": tok}
+            if device:
+                dev_tok = secrets.token_urlsafe(32)
+                self._device_sessions[dev_tok] = {"session_key": session_key}
+                body["device_token"] = dev_tok
+            if self._connect_callback:
+                self._connect_callback()
+            asyncio.create_task(self.broadcast(
+                {"type": "sys", "text": "Remote connection established."}
+            ))
+            return body
+
         @app.post("/login")
         async def login(req: Request):
-            body    = await req.json()
-            entered = str(body.get("pin", "")).strip().upper()
+            ip = _client_ip(req)
+            if _login_locked(ip):
+                return JSONResponse({"ok": False, "error": "Too many attempts"},
+                                    status_code=429)
+            body = await req.json()
+            raw  = str(body.get("pin", "")).strip()
+            if raw and len(raw) == len(self._phone_password) and hmac.compare_digest(raw, self._phone_password):
+                self._login_failures.pop(ip, None)
+                return JSONResponse(_open_session(raw, device=True))
+            entered = raw.upper()
             now     = time.time()
             if entered in self._pending_keys and self._pending_keys[entered] > now:
                 del self._pending_keys[entered]          # one-time use
-                tok = secrets.token_urlsafe(32)
-                self._tokens.add(tok)
-                self._token_keys[tok] = entered
-                self._aes_key(entered)                   # pre-derive & cache
-                if self._connect_callback:
-                    self._connect_callback()
-                asyncio.create_task(self.broadcast(
-                    {"type": "sys", "text": "Remote connection established."}
-                ))
-                # Bearer token in response body — no cookies needed (works on any browser/HTTP)
-                return JSONResponse({"ok": True, "token": tok})
+                self._login_failures.pop(ip, None)
+                return JSONResponse(_open_session(entered))
+            _login_fail(ip)
             return JSONResponse({"ok": False, "error": "Invalid or expired key"},
                                 status_code=401)
 
@@ -835,7 +971,91 @@ class DashboardServer:
             finally:
                 self._clients.discard(websocket)
 
+        @app.get("/earth", response_class=HTMLResponse)
+        async def earth_page():
+            return HTMLResponse(_read("earth.html"))
+
+        @app.get("/earth-texture.jpg")
+        async def earth_texture():
+            return FileResponse(str(STATIC_DIR / "earth.jpg"), media_type="image/jpeg")
+
+        @app.get("/api/earth/planes")
+        async def earth_planes():
+            try:
+                return JSONResponse({"planes": await asyncio.to_thread(_plane_snapshot)})
+            except Exception as e:
+                return JSONResponse({"planes": [], "error": str(e)})
+
+        @app.get("/api/earth/iss")
+        async def earth_iss():
+            try:
+                return JSONResponse({"iss": await asyncio.to_thread(_iss_snapshot)})
+            except Exception as e:
+                return JSONResponse({"iss": None, "error": str(e)})
+
+        @app.get("/api/earth/quakes")
+        async def earth_quakes():
+            try:
+                return JSONResponse({"quakes": await asyncio.to_thread(_quake_snapshot)})
+            except Exception as e:
+                return JSONResponse({"quakes": [], "error": str(e)})
+
         return app
+
+    # ── phone link ────────────────────────────────────────────────────────
+
+    def get_public_url(self) -> str:
+        return self._public_url
+
+    def _boot_phone_link(self) -> None:
+        """Write the password file and open a Cloudflare quick tunnel.
+
+        The quick tunnel needs no account. Its address changes each time Jarvis
+        starts. A named tunnel with a fixed address needs a Cloudflare login.
+        """
+        _write_phone_access(self._phone_password, self._public_url, self.get_url())
+        try:
+            exe = self._ensure_cloudflared()
+        except Exception as e:
+            print(f"[Dashboard] Phone tunnel unavailable: {e}")
+            return
+        import subprocess
+        try:
+            proc = subprocess.Popen(
+                [str(exe), "tunnel", "--url", f"http://127.0.0.1:{LOCAL_PORT}",
+                 "--no-autoupdate"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as e:
+            print(f"[Dashboard] Phone tunnel did not start: {e}")
+            return
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            if self._public_url:
+                continue
+            match = _TUNNEL_RE.search(line)
+            if not match:
+                continue
+            self._public_url = match.group(0)
+            _write_phone_access(self._phone_password, self._public_url, self.get_url())
+            print(f"[Dashboard] Phone link: {self._public_url}")
+            print(f"[Dashboard] Password file: {_phone_dir() / 'phone_access.txt'}")
+
+    def _ensure_cloudflared(self) -> Path:
+        dest = _phone_dir() / "cloudflared.exe"
+        if dest.exists() and dest.stat().st_size > 1_000_000:
+            return dest
+        import urllib.request
+        url = ("https://github.com/cloudflare/cloudflared/releases/latest/"
+               "download/cloudflared-windows-amd64.exe")
+        print("[Dashboard] Downloading the phone tunnel…")
+        urllib.request.urlretrieve(url, dest)
+        return dest
 
     # ── serve ─────────────────────────────────────────────────────────────
 
@@ -851,7 +1071,7 @@ class DashboardServer:
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
         )
         print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
-        await uvicorn.Server(cfg).serve()
+        await self._serve_safe(cfg, "manual phone port")
 
     async def serve(self) -> None:
         if not _DEPS_OK:
@@ -873,6 +1093,11 @@ class DashboardServer:
         if use_ssl:
             asyncio.create_task(self._serve_alias())
 
+        # Local plain HTTP for the Earth view and the phone tunnel. The public
+        # tunnel terminates HTTPS, so the phone still gets a secure page.
+        asyncio.create_task(self._serve_local())
+        asyncio.get_event_loop().run_in_executor(None, self._boot_phone_link)
+
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT, log_level="warning",
             **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
@@ -881,4 +1106,20 @@ class DashboardServer:
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
-        await uvicorn.Server(cfg).serve()
+        print(f"[Dashboard] Earth view: http://127.0.0.1:{LOCAL_PORT}/earth")
+        await self._serve_safe(cfg, "phone server")
+
+    async def _serve_safe(self, cfg, label: str) -> None:
+        """A busy port makes uvicorn call sys.exit, which would close Jarvis."""
+        try:
+            await uvicorn.Server(cfg).serve()
+        except SystemExit:
+            print(f"[Dashboard] {label} is already running. Jarvis will stay open.")
+        except Exception as e:
+            print(f"[Dashboard] {label} stopped: {e}")
+
+    async def _serve_local(self) -> None:
+        cfg = uvicorn.Config(
+            self.app, host="127.0.0.1", port=LOCAL_PORT, log_level="warning",
+        )
+        await self._serve_safe(cfg, "local phone port")

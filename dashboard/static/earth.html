@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JARVIS Earth</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #07090f; color: #dde3ed;
+      font-family: "Segoe UI", sans-serif; overflow: hidden; }
+    #view, #map { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+    #map { display: none; background: #07090f; }
+    .leaflet-container { width: 100%; height: 100%; background: #07090f; }
+    header { position: fixed; top: 12px; left: 12px; z-index: 5; display: flex;
+      gap: 8px; flex-wrap: wrap; align-items: center; }
+    button { background: rgba(7,9,15,0.82); color: #dde3ed; border: 1px solid rgba(255,255,255,0.16);
+      border-radius: 8px; padding: 8px 12px; cursor: pointer; font-size: 13px; }
+    button.on { border-color: #6366f1; color: #fff; }
+    #status { position: fixed; left: 12px; bottom: 12px; z-index: 5; font-size: 12px;
+      color: #9aa6b8; background: rgba(7,9,15,0.72); padding: 8px 10px; border-radius: 8px; }
+  </style>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+</head>
+<body>
+  <div id="view"></div>
+  <div id="map"></div>
+  <header>
+    <button id="mode" class="on">Globe</button>
+    <button id="planes" class="on">Planes</button>
+    <button id="quakes" class="on">Earthquakes</button>
+    <button id="station" class="on">Station</button>
+  </header>
+  <div id="status">Loading the planet…</div>
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  </script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    const status = document.getElementById("status");
+    const view = document.getElementById("view");
+    const mapEl = document.getElementById("map");
+    const show = { planes: true, quakes: true, station: true, satellite: false };
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    view.appendChild(renderer.domElement);
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 20);
+    camera.position.z = 2.6;
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enablePan = false;
+    controls.minDistance = 1.3;
+    controls.maxDistance = 6;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.3);
+    sun.position.set(5, 2, 3);
+    scene.add(sun);
+
+    const globe = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 64, 64),
+      new THREE.MeshPhongMaterial({ color: 0x1d4e89 })
+    );
+    scene.add(globe);
+    const loader = new THREE.TextureLoader();
+    loader.load("/earth-texture.jpg", (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace;
+      globe.material.map = tex;
+      globe.material.needsUpdate = true;
+      status.textContent = "Drag the globe. Satellite switches to the photo map.";
+    });
+
+    const markers = new THREE.Group();
+    scene.add(markers);
+
+    function latLon(lat, lon, r = 1.012) {
+      const phi = (90 - lat) * Math.PI / 180;
+      const theta = (lon + 180) * Math.PI / 180;
+      return new THREE.Vector3(
+        -r * Math.sin(phi) * Math.cos(theta),
+        r * Math.cos(phi),
+        r * Math.sin(phi) * Math.sin(theta)
+      );
+    }
+    function dot(color, size = 0.012) {
+      return new THREE.Mesh(
+        new THREE.SphereGeometry(size, 8, 8),
+        new THREE.MeshBasicMaterial({ color })
+      );
+    }
+
+    const map = L.map(mapEl, { worldCopyJump: true }).setView([20, 10], 2);
+    const streets = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 18, attribution: "&copy; OpenStreetMap"
+    });
+    const satellite = L.tileLayer(
+      "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      { maxZoom: 18, attribution: "Esri" }
+    );
+    streets.addTo(map);
+    const layer = L.layerGroup().addTo(map);
+
+    function paintMap(planes, quakes, iss) {
+      layer.clearLayers();
+      if (show.planes) {
+        for (const p of planes) {
+          L.circleMarker([p.lat, p.lon], { radius: 3, color: "#7dd3fc", weight: 1 })
+            .bindTooltip(`${p.call} · ${Math.round(p.alt)} m`).addTo(layer);
+        }
+      }
+      if (show.quakes) {
+        for (const q of quakes) {
+          L.circleMarker([q.lat, q.lon], { radius: 4 + (q.mag || 0), color: "#f87171", weight: 1 })
+            .bindTooltip(`M${q.mag} ${q.place}`).addTo(layer);
+        }
+      }
+      if (show.station && iss) {
+        L.circleMarker([iss.lat, iss.lon], { radius: 7, color: "#fbbf24", weight: 2 })
+          .bindTooltip("International Space Station").addTo(layer);
+      }
+    }
+
+    let latest = { planes: [], quakes: [], iss: null };
+    function paintGlobe() {
+      while (markers.children.length) {
+        const child = markers.children.pop();
+        child.geometry.dispose();
+        child.material.dispose();
+      }
+      if (show.planes) {
+        for (const p of latest.planes) {
+          const m = dot(0x7dd3fc, 0.008);
+          m.position.copy(latLon(p.lat, p.lon));
+          markers.add(m);
+        }
+      }
+      if (show.quakes) {
+        for (const q of latest.quakes) {
+          const m = dot(0xf87171, 0.014);
+          m.position.copy(latLon(q.lat, q.lon));
+          markers.add(m);
+        }
+      }
+      if (show.station && latest.iss) {
+        const m = dot(0xfbbf24, 0.02);
+        m.position.copy(latLon(latest.iss.lat, latest.iss.lon, 1.06));
+        markers.add(m);
+      }
+    }
+
+    async function pull(path) {
+      const res = await fetch(path);
+      if (!res.ok) throw new Error(path);
+      return res.json();
+    }
+    async function refresh() {
+      try {
+        const [planes, quakes, iss] = await Promise.all([
+          pull("/api/earth/planes"),
+          pull("/api/earth/quakes"),
+          pull("/api/earth/iss"),
+        ]);
+        latest = {
+          planes: planes.planes || [],
+          quakes: quakes.quakes || [],
+          iss: iss.iss || null,
+        };
+        paintGlobe();
+        paintMap(latest.planes, latest.quakes, latest.iss);
+        const bits = [`${latest.planes.length} planes`, `${latest.quakes.length} quakes`];
+        if (latest.iss) bits.push("station live");
+        status.textContent = bits.join(" · ");
+      } catch (e) {
+        status.textContent = "Live data is not reachable yet.";
+      }
+    }
+
+    document.getElementById("mode").onclick = () => {
+      show.satellite = !show.satellite;
+      const btn = document.getElementById("mode");
+      btn.textContent = show.satellite ? "Satellite" : "Globe";
+      btn.classList.toggle("on", true);
+      view.style.display = show.satellite ? "none" : "block";
+      mapEl.style.display = show.satellite ? "block" : "none";
+      if (show.satellite) {
+        streets.remove();
+        satellite.addTo(map);
+        setTimeout(() => map.invalidateSize(), 50);
+      } else {
+        satellite.remove();
+        streets.addTo(map);
+      }
+    };
+    for (const name of ["planes", "quakes", "station"]) {
+      document.getElementById(name).onclick = (ev) => {
+        show[name] = !show[name];
+        ev.target.classList.toggle("on", show[name]);
+        paintGlobe();
+        paintMap(latest.planes, latest.quakes, latest.iss);
+      };
+    }
+
+    addEventListener("resize", () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+    function frame() {
+      requestAnimationFrame(frame);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    frame();
+    refresh();
+    setInterval(refresh, 20000);
+  </script>
+</body>
+</html>

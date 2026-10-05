@@ -63,12 +63,11 @@
       border: 1.5px solid var(--border);
       border-radius: 14px;
       color: var(--text);
-      font-size: 30px;
+      font-size: 22px;
       font-weight: 700;
       font-family: 'Courier New', monospace;
       text-align: center;
-      letter-spacing: 10px;
-      text-transform: uppercase;
+      letter-spacing: 1px;
       outline: none;
       transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
       caret-color: var(--accent);
@@ -137,18 +136,16 @@
     <div class="logo"><em>J</em>ARVIS</div>
     <div class="sub">Remote Access</div>
     <p id="reconnecting">Reconnecting…</p>
-    <p class="hint">Press <strong style="color:var(--text)">Remote Control</strong> in the JARVIS desktop app to get a QR code or session key.</p>
+    <p class="hint">Enter your password. On the same Wi-Fi you can also use the 6-character key from <strong style="color:var(--text)">Remote Control</strong>.</p>
     <div class="key-wrap">
-      <input class="key-input" id="key" type="text" maxlength="6"
-             autocomplete="off" autocorrect="off" spellcheck="false"
-             placeholder="· · · · · ·">
+      <input class="key-input" id="key" type="text" maxlength="64"
+             autocomplete="current-password" autocorrect="off" spellcheck="false"
+             placeholder="Password">
     </div>
     <div class="err" id="err"></div>
     <button class="btn" onclick="doLogin()">CONNECT</button>
     <p class="voice-note">
-      🎤 <strong style="color:var(--text)">Voice commands:</strong> open
-      <code>chrome://flags</code> on your phone, search
-      <code>Insecure origins treated as secure</code>, add your JARVIS URL, tap Relaunch.
+      🎤 The first time you talk, allow the microphone when the browser asks.
     </p>
   </div>
 
@@ -181,8 +178,8 @@
     inp.focus();
 
     inp.addEventListener('input', () => {
-      inp.value = inp.value.toUpperCase().replace(/[^A-Z2-9]/g, '');
-      if (inp.value.length === 6) doLogin();
+      const v = inp.value.trim();
+      if (/^[A-Za-z2-9]{6}$/.test(v)) doLogin();
     });
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 
@@ -204,6 +201,7 @@
       if (data.ok && data.token) {
         sessionStorage.setItem('jarvis_key', key);
         sessionStorage.setItem('jarvis_token', data.token);
+        if (data.device_token) localStorage.setItem('jarvis_device_token', data.device_token);
         location.href = '/';
       } else {
         inp.value = '';

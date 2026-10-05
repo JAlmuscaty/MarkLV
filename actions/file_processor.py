@@ -21,12 +21,12 @@ import re
 import json
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from datetime import datetime
 
 # Model choice, timeout and fallback ladder all live in core/gemini.py.
 from core import gemini
+from core.drive_scope import denial, is_allowed, save_dir
 
 def _get_api_key() -> str:
     config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
@@ -684,7 +684,7 @@ def _process_video(path: Path, action: str, params: dict, speak=None) -> str:
     if action == "transcribe":
         if not _ffmpeg_available():
             return "ffmpeg not found. Needed for video transcription."
-        tmp_audio = Path(tempfile.mktemp(suffix=".mp3"))
+        tmp_audio = save_dir() / f"jarvis_audio_{int(datetime.now().timestamp())}.mp3"
         try:
             subprocess.run(
                 ["ffmpeg", "-i", str(path), "-q:a", "0", "-map", "a",
@@ -738,9 +738,14 @@ def _process_archive(path: Path, action: str, params: dict, speak=None) -> str:
 
     if action == "extract":
         dest = Path(params.get("destination", str(path.parent / path.stem)))
+        if not is_allowed(dest):
+            return denial(dest)
         dest.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.unpack_archive(path, dest)
+            try:
+                shutil.unpack_archive(path, dest, filter="data")
+            except TypeError:
+                shutil.unpack_archive(path, dest)
             return f"Extracted to: {dest}"
         except Exception as e:
             return f"Extract failed: {e}"
@@ -785,6 +790,9 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     file_path_str = parameters.get("file_path", "").strip()
     if not file_path_str:
         return "No file path provided."
+
+    if not is_allowed(file_path_str):
+        return denial(file_path_str)
 
     path = Path(file_path_str)
     if not path.exists():

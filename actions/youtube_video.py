@@ -6,6 +6,8 @@ import time
 import subprocess
 import shutil
 from pathlib import Path
+
+from core.drive_scope import save_dir
 from datetime import datetime
 from urllib.parse import quote_plus
 
@@ -196,8 +198,7 @@ def _summarize_with_gemini(transcript: str, video_url: str) -> str:
 def _save_summary(content: str, video_url: str) -> str:
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"youtube_summary_{ts}.txt"
-    desktop  = Path.home() / "Desktop"
-    desktop.mkdir(parents=True, exist_ok=True)
+    desktop  = save_dir()
     filepath = desktop / filename
 
     header = (
@@ -344,7 +345,7 @@ def _handle_summarize(parameters: dict, player, speak) -> str:
 
     if parameters.get("save", False):
         saved_path = _save_summary(summary, url)
-        return f"Summary complete and saved to Desktop: {saved_path}"
+        return f"Summary complete and saved to: {saved_path}"
 
     return summary
 

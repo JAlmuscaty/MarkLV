@@ -5,6 +5,8 @@ import re
 import time
 from pathlib import Path
 
+from core.drive_scope import denial, is_allowed, save_dir
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -13,7 +15,8 @@ def get_base_dir():
 
 BASE_DIR           = get_base_dir()
 API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
-DESKTOP            = Path.home() / "Desktop"
+def _output_dir() -> Path:
+    return save_dir()
 MAX_BUILD_ATTEMPTS = 3
 # Model choice lives in core/gemini.py, and so does the timeout and the
 # fallback ladder. Writing a model name here is what left this file hanging
@@ -58,14 +61,16 @@ def _resolve_save_path(output_path: str, language: str) -> Path:
     }
     if output_path:
         p = Path(output_path)
-        return p if p.is_absolute() else DESKTOP / p
+        return p if p.is_absolute() else _output_dir() / p
     ext = ext_map.get((language or "python").lower(), ".py")
-    return DESKTOP / f"jarvis_code{ext}"
+    return _output_dir() / f"jarvis_code{ext}"
 
 
 def _read_file(file_path: str) -> tuple[str, str]:
     if not file_path:
         return "", "No file path provided."
+    if not is_allowed(file_path):
+        return "", denial(file_path)
     p = Path(file_path)
     if not p.exists():
         return "", f"File not found: {file_path}"
@@ -76,6 +81,8 @@ def _read_file(file_path: str) -> tuple[str, str]:
 
 
 def _save_file(path: Path, content: str) -> str:
+    if not is_allowed(path):
+        return denial(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -100,7 +107,7 @@ def _has_error(output: str) -> bool:
 def _take_screenshot() -> Path | None:
     try:
         import pyautogui
-        screenshot_path = Path.home() / "Desktop" / f"jarvis_debug_{int(time.time())}.png"
+        screenshot_path = save_dir() / f"jarvis_debug_{int(time.time())}.png"
         screenshot = pyautogui.screenshot()
         screenshot.save(str(screenshot_path))
         print(f"[Code] 📸 Screenshot: {screenshot_path}")
@@ -377,6 +384,8 @@ Explanation:"""
 def _run_action(file_path, args, timeout, player) -> str:
     if not file_path:
         return "Please provide a file path to run, sir."
+    if not is_allowed(file_path):
+        return denial(file_path)
     p = Path(file_path)
     if not p.exists():
         return f"File not found: {file_path}"

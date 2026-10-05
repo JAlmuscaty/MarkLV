@@ -4,9 +4,21 @@ import sys
 import json
 import shutil
 import subprocess
-import tempfile
 import platform
 from pathlib import Path
+
+from core.drive_scope import (
+    ALLOWED_DRIVE,
+    BoundedPath,
+    denial,
+    guarded_copy2,
+    guarded_copytree,
+    guarded_disk_usage,
+    guarded_os_path,
+    is_allowed,
+    save_dir,
+    shortcut,
+)
 from datetime import datetime
 
 try:
@@ -28,12 +40,8 @@ def _get_api_key() -> str:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
     
-def _get_desktop() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DESKTOP_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Desktop"
+def _get_desktop() -> Path | None:
+    return shortcut("desktop")
 
 def _build_sandbox() -> dict:
     import time
@@ -50,32 +58,18 @@ def _build_sandbox() -> dict:
 
     sandbox = {
         "__builtins__": safe_builtins,
-        "Path": Path,
+        "Path": BoundedPath,
         "time": time,
         "shutil": type("shutil", (), {
-            "copy2":      shutil.copy2,
-            "copytree":   shutil.copytree,
-            "disk_usage": shutil.disk_usage,
+            "copy2":      guarded_copy2,
+            "copytree":   guarded_copytree,
+            "disk_usage": guarded_disk_usage,
         })(),
-        "os_path": os.path,  
+        "os_path": guarded_os_path(),
     }
 
     if _PYAUTOGUI:
         sandbox["pyautogui"] = pyautogui
-
-    if _OS == "Windows":
-        try:
-            import ctypes
-            import winreg
-            sandbox["ctypes"] = ctypes
-            sandbox["winreg"] = type("winreg", (), {
-                # Sadece okuma
-                "OpenKey":      winreg.OpenKey,
-                "QueryValueEx": winreg.QueryValueEx,
-                "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
-            })()
-        except ImportError:
-            pass
 
     return sandbox
 
@@ -105,15 +99,14 @@ def _ask_gemini_for_desktop_action(task: str) -> str:
 
     from google import genai as _genai
 
-    desktop = str(_get_desktop())
+    desktop_path = _get_desktop()
+    desktop = str(desktop_path) if desktop_path else f"(no desktop folder on {ALLOWED_DRIVE}:)"
 
-    os_specific = ""
-    if _OS == "Windows":
-        os_specific = "- ctypes (Windows API calls, read-only)\n- winreg (registry READ only)"
-    elif _OS == "Darwin":
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
-    else:
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
+    os_specific = (
+        f"- Every path must stay on the {ALLOWED_DRIVE}: drive. "
+        f"C: and every other drive are refused.\n"
+        "- subprocess, ctypes and the registry are NOT available"
+    )
 
     prompt = f"""You are a desktop automation assistant.
 Current OS: {_OS}
@@ -154,6 +147,8 @@ Task: {task}"""
         return f"ERROR: {e}"
 
 def set_wallpaper(image_path: str) -> str:
+    if not is_allowed(image_path):
+        return denial(image_path)
     path = Path(image_path).expanduser().resolve()
     if not path.exists():
         return f"Image not found: {image_path}"
@@ -166,7 +161,7 @@ def set_wallpaper(image_path: str) -> str:
             if path.suffix.lower() in {".webp", ".png"}:
                 try:
                     from PIL import Image
-                    bmp_path = Path(tempfile.mktemp(suffix=".bmp"))
+                    bmp_path = save_dir() / "jarvis_wallpaper.bmp"
                     Image.open(path).convert("RGB").save(bmp_path, "BMP")
                     path = bmp_path
                 except ImportError:
@@ -241,7 +236,7 @@ def set_wallpaper_from_url(url: str) -> str:
     try:
         import urllib.request
         suffix = Path(url.split("?")[0]).suffix or ".jpg"
-        tmp    = Path(tempfile.mktemp(suffix=suffix))
+        tmp    = save_dir() / f"jarvis_wallpaper{suffix}"
         urllib.request.urlretrieve(url, str(tmp))
         result = set_wallpaper(str(tmp))
         try:
@@ -307,7 +302,12 @@ _SKIP_EXTENSIONS = {
 
 
 def organize_desktop(mode: str = "by_type") -> str:
-    desktop       = _get_desktop()
+    desktop = _get_desktop()
+    if desktop is None:
+        return (
+            f"The desktop folder is not on the {ALLOWED_DRIVE}: drive, "
+            f"so it cannot be organized."
+        )
     skip_exts     = _SKIP_EXTENSIONS.get(_OS, set())
     moved, skipped = [], []
 
@@ -351,6 +351,11 @@ def organize_desktop(mode: str = "by_type") -> str:
 
 def list_desktop() -> str:
     desktop = _get_desktop()
+    if desktop is None:
+        return (
+            f"The desktop folder is not on the {ALLOWED_DRIVE}: drive, "
+            f"so it cannot be listed."
+        )
     items   = []
     for item in sorted(desktop.iterdir()):
         if item.name.startswith("."):
@@ -375,7 +380,12 @@ def list_desktop() -> str:
 
 
 def clean_desktop() -> str:
-    desktop     = _get_desktop()
+    desktop = _get_desktop()
+    if desktop is None:
+        return (
+            f"The desktop folder is not on the {ALLOWED_DRIVE}: drive, "
+            f"so it cannot be cleaned."
+        )
     skip_exts   = _SKIP_EXTENSIONS.get(_OS, set())
     today       = datetime.now().strftime("%Y-%m-%d")
     archive_dir = desktop / f"Desktop Archive {today}"
@@ -396,7 +406,12 @@ def clean_desktop() -> str:
 
 
 def get_desktop_stats() -> str:
-    desktop    = _get_desktop()
+    desktop = _get_desktop()
+    if desktop is None:
+        return (
+            f"The desktop folder is not on the {ALLOWED_DRIVE}: drive, "
+            f"so there are no desktop stats."
+        )
     files      = [i for i in desktop.iterdir() if i.is_file()]
     folders    = [i for i in desktop.iterdir() if i.is_dir()]
     total_size = sum(f.stat().st_size for f in files if f.exists())

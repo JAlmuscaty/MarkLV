@@ -61,6 +61,8 @@ try:
 except Exception:      # pragma: no cover — HUD must never die over cosmetics
     HoloAvatar = None
 
+from core.drive_scope import denial, is_allowed, root
+
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -267,7 +269,7 @@ class _SysMetrics:
         self._pynvml_h  = None
         self._pynvml_ok = None         # None=untested, False=unavailable here
         self._nv_unix   = None         # cached (lib, dev) for Linux/macOS NVML
-        self._wmi_conn  = None         # cached WMI connection (creating one is slow)
+        self._wmi_temp  = -1.0
         self._wmi_ok    = None         # None=untested, False=unavailable here
         t = threading.Thread(target=self._loop, daemon=True)
         t.start()
@@ -372,22 +374,34 @@ class _SysMetrics:
         except Exception:
             pass
 
-        # Windows: wmi module (pure Python COM, zero subprocess). Reuse a single
-        # connection — building a fresh wmi.WMI() on every poll spins up a COM
-        # connection each time and is very slow. Give up after one failure.
+        # Windows temperature used to come from an in-process WMI call on this
+        # background thread. That call uses COM, and Qt already owns COM on the
+        # window thread, so the two deadlock at random and Windows closes Jarvis
+        # as "not responding". Ask once, in a separate process, and remember it.
         if _OS == "Windows" and self._wmi_ok is not False:
-            try:
-                if self._wmi_conn is None:
-                    import wmi  # type: ignore
-                    self._wmi_conn = wmi.WMI(namespace="root/wmi")
-                tz = self._wmi_conn.MSAcpi_ThermalZoneTemperature()
-                if tz:
-                    return (tz[0].CurrentTemperature / 10.0) - 273.15
-            except Exception:
-                self._wmi_ok   = False
-                self._wmi_conn = None
+            if self._wmi_ok is None:
+                self._wmi_temp = self._read_windows_temp()
+                self._wmi_ok = self._wmi_temp >= 0
+            if self._wmi_ok:
+                return self._wmi_temp
 
         return -1.0   # N/A — zero subprocess on all platforms
+
+    @staticmethod
+    def _read_windows_temp() -> float:
+        try:
+            done = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "(Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi "
+                 "| Select-Object -First 1 -ExpandProperty CurrentTemperature)"],
+                capture_output=True, text=True, timeout=3, **_WIN_HIDE,
+            )
+            raw = (done.stdout or "").strip().split()
+            if raw:
+                return (float(raw[0]) / 10.0) - 273.15
+        except Exception:
+            pass
+        return -1.0
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1197,7 +1211,7 @@ class FileDropZone(QWidget):
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select a file for JARVIS", str(Path.home()),
+            self, "Select a file for JARVIS", str(root()),
             "All Files (*.*);;"
             "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
             "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
@@ -1211,6 +1225,11 @@ class FileDropZone(QWidget):
             self._set_file(path)
 
     def _set_file(self, path: str):
+        if not is_allowed(path):
+            self._current_file = None
+            self._canvas.update()
+            self.file_selected.emit(path)
+            return
         self._current_file = path
         self._canvas.update()
         self.file_selected.emit(path)
@@ -2958,6 +2977,7 @@ class MainWindow(QMainWindow):
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
+    _phone_sig      = pyqtSignal()           # phone connected — never touch widgets off the UI thread
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -3241,6 +3261,7 @@ class MainWindow(QMainWindow):
         self._quiz_sig.connect(self._show_quiz)
         self._quiz_hide_sig.connect(self._hide_quiz)
         self._review_sig.connect(self._show_review)
+        self._phone_sig.connect(self._on_phone_connected_ui)
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -4898,6 +4919,12 @@ class MainWindow(QMainWindow):
         return w
 
     def _on_file_selected(self, path: str):
+        if not is_allowed(path):
+            self._current_file = None
+            message = denial(path)
+            self._file_hint.setText(message)
+            self._log.append_log(message)
+            return
         self._current_file = path
         p    = Path(path)
         cat  = _file_category(p)
@@ -4915,6 +4942,9 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
     def notify_phone_connected(self) -> None:
+        self._phone_sig.emit()
+
+    def _on_phone_connected_ui(self) -> None:
         if self._remote_overlay and self._remote_overlay.isVisible():
             self._remote_overlay.mark_connected()
 

@@ -3,6 +3,8 @@ import subprocess
 import platform
 import shutil
 
+from core.drive_scope import ALLOWED_DRIVE, denial, foreign_drive, is_allowed, looks_like_filesystem, root
+
 try:
     import psutil
     _PSUTIL = True
@@ -79,6 +81,15 @@ def _normalize(raw: str) -> str:
 
 def _launch_windows(app_name: str) -> bool:
 
+    if app_name.lower() in ("explorer.exe", "explorer"):
+        try:
+            subprocess.Popen(["explorer.exe", str(root())])
+            time.sleep(1.0)
+            return True
+        except Exception as e:
+            print(f"[open_app] explorer failed: {e}")
+            return False
+
     if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
         try:
             subprocess.Popen(
@@ -93,6 +104,9 @@ def _launch_windows(app_name: str) -> bool:
             print(f"[open_app] subprocess failed: {e}")
 
     if ":" in app_name:
+        if looks_like_filesystem(app_name) and not is_allowed(app_name):
+            print(f"[open_app] refused path off {app_name}")
+            return False
         try:
             subprocess.Popen(f"start {app_name}", shell=True)
             time.sleep(1.0)
@@ -251,6 +265,16 @@ def open_app(
     launcher = _OS_LAUNCHERS.get(_SYSTEM)
     if launcher is None:
         return f"Unsupported operating system: {_SYSTEM}"
+
+    for candidate in (app_name, _normalize(app_name)):
+        other = foreign_drive(candidate)
+        if other:
+            return (
+                f"Access denied: {candidate} uses {other}:. "
+                f"File access is limited to the {ALLOWED_DRIVE}: drive."
+            )
+        if looks_like_filesystem(candidate) and not is_allowed(candidate):
+            return denial(candidate)
 
     normalized = _normalize(app_name)
     print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")

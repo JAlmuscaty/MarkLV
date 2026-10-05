@@ -15,6 +15,8 @@ import time
 import random
 from pathlib import Path
 
+from core.drive_scope import denial, is_allowed, save_dir
+
 try:
     import pyautogui
     pyautogui.FAILSAFE = True
@@ -57,23 +59,15 @@ def _get_os() -> str:
 def _get_api_key() -> str:
     return _load_config().get("gemini_api_key", "")
 
-_SAFE_SCREENSHOT_ROOTS = (
-    Path.home(),
-)
-
-def _safe_screenshot_path(requested: str | None) -> Path:
-    fallback = Path.home() / "Desktop" / "jarvis_screenshot.png"
+def _safe_screenshot_path(requested: str | None) -> Path | str:
+    fallback = save_dir() / "jarvis_screenshot.png"
     if not requested:
         return fallback
-    try:
-        p = Path(requested).expanduser().resolve()
-        for root in _SAFE_SCREENSHOT_ROOTS:
-            if p.is_relative_to(root.resolve()):
-                p.parent.mkdir(parents=True, exist_ok=True)
-                return p
-    except Exception:
-        pass
-    return fallback
+    if not is_allowed(requested):
+        return denial(requested)
+    p = Path(requested).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
 def _require_pyautogui():
     if not _PYAUTOGUI:
@@ -242,6 +236,8 @@ def _clipboard_paste(text: str) -> str:
 def _screenshot(save_path: str | None = None) -> str:
     _require_pyautogui()
     path = _safe_screenshot_path(save_path)
+    if isinstance(path, str):
+        return path
     img  = pyautogui.screenshot()
     img.save(str(path))
     return f"Screenshot saved: {path}"
@@ -578,7 +574,7 @@ TOOL = {
             },
             "path": {
                 "type": "STRING",
-                "description": "Save path for screenshot"
+                "description": "Save path for screenshot. Must be on the D: drive. Defaults to D:\\Jarvis."
             }
         },
         "required": [
