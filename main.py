@@ -74,6 +74,7 @@ from memory.config_manager     import (
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
 )
 from core                     import gemini as _gemini
+from core                     import call_hold
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
@@ -879,7 +880,7 @@ class JarvisLive:
             self._out_level = 0.0
         if value:
             self.ui.set_state("SPEAKING")
-        elif not self.ui.muted:
+        elif not self.ui.muted and not call_hold.active():
             self.ui.set_state("LISTENING")
 
     def set_push_to_talk(self, enabled: bool) -> str:
@@ -1275,7 +1276,7 @@ class JarvisLive:
             traceback.print_exc()
             self.speak_error(name, e)
 
-        if not self.ui.muted:
+        if not self.ui.muted and not call_hold.active():
             self.ui.set_state("LISTENING")
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
@@ -1315,6 +1316,10 @@ class JarvisLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            # A WhatsApp call owns the room. Nothing is streamed, and the wake
+            # word stays off, until the call window is gone.
+            if call_hold.active():
+                return
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
@@ -1661,6 +1666,18 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    continue
+
+                # Same hold as the microphone: drop anything already queued so
+                # Jarvis does not talk over a ringing or connected call, and
+                # does not play that backlog when the call ends.
+                if call_hold.active():
+                    self.set_speaking(False)
+                    while True:
+                        try:
+                            self.audio_in_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
                     continue
 
                 self.set_speaking(True)
@@ -2012,6 +2029,8 @@ class JarvisLive:
                 self._phone_active = False
                 continue
             self._phone_active = True   # phone is streaming — silence PC mic
+            if call_hold.active():
+                continue
             with self._speaking_lock:
                 speaking = self._is_speaking
             if not speaking and not self.ui.muted:
