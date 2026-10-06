@@ -99,8 +99,6 @@ class WhatsApp:
         self._raise(win)
         ctrl = self._find_named(win, _VOICE_NAMES, reject=_VIDEO_MARKS)
         if ctrl is not None:
-            if not self._chat_visible(win, contact):
-                return False, f"WhatsApp did not open a chat named {contact}."
             point = self._click_control(ctrl)
             return True, (
                 f"Voice call button at {point[0]}, {point[1]} "
@@ -124,17 +122,52 @@ class WhatsApp:
         self._click_screen(point[0], point[1])
         return True, f"Voice call button at {point[0]}, {point[1]} ({how})."
 
+    def click_decline(self) -> bool:
+        """Click Decline if that control is on screen. No picture, so it stays fast."""
+        ctrl = self._decline_control()
+        if ctrl is None:
+            return False
+        try:
+            self._click_control(ctrl)
+            return True
+        except Exception:
+            return False
+
+    def ui_says_call(self) -> bool:
+        win = self._window()
+        if win is None:
+            return False
+        blob = " ".join(self._texts(win)).lower()
+        return any(mark in blob for mark in _CALL_MARKS)
+
+    def _decline_control(self):
+        from pywinauto import Desktop
+
+        for win in Desktop(backend="uia").windows():
+            title = (win.window_text() or "").strip().lower()
+            if "whatsapp" not in title and "arama" not in title:
+                continue
+            ctrl = self._find_named(win, _DECLINE_NAMES, reject=_VOICE_NAMES)
+            if ctrl is not None:
+                return ctrl
+        return None
+
     def decline_incoming(self) -> tuple[bool, str, str]:
         """(ok, detail, caller name)."""
-        win = self._call_surface()
+        ctrl = self._decline_control()
+        if ctrl is not None:
+            caller = ""
+            try:
+                caller = self._caller_name(ctrl.top_level_parent())
+            except Exception:
+                pass
+            self._click_control(ctrl)
+            return True, "Declined the incoming call.", caller
+        win = self._window()
         if win is None:
             return False, "There is no incoming WhatsApp call on screen.", ""
         self._raise(win)
         caller = self._caller_name(win)
-        ctrl = self._find_named(win, _DECLINE_NAMES, reject=_VOICE_NAMES)
-        if ctrl is not None:
-            self._click_control(ctrl)
-            return True, "Declined the incoming call.", caller
         point, how = self._icon_point(
             win,
             (

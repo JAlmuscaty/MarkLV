@@ -84,6 +84,14 @@
     .fc-status.err  { color: #f87171; }
     .fc-dl { display:block; margin-top:6px; font-size:11px; color:var(--accent); text-decoration:none; font-weight:600; }
     .fc-dl:hover { opacity: 0.8; }
+    .msg-photo {
+      align-self: flex-end; max-width: 82%;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 14px; border-bottom-right-radius: 4px;
+      padding: 6px; animation: pop 0.18s ease;
+    }
+    .msg-photo img { display: block; width: 100%; max-height: 360px; object-fit: cover; border-radius: 10px; }
+    .msg-photo .fc-lbl { margin: 6px 8px 2px; }
 
     /* ── FOOTER ── */
     footer { flex-shrink:0; padding:10px 14px; border-top:1px solid var(--border); background:rgba(7,9,15,0.95); display:flex; gap:8px; align-items:center; }
@@ -145,8 +153,8 @@
   <main id="feed"></main>
   <footer>
     <input id="inp" placeholder="Send a command to JARVIS…" autocomplete="off">
-    <label class="btn-attach" for="file-inp" title="Send file">📎</label>
-    <input type="file" id="file-inp" multiple accept="*/*" style="display:none">
+    <label class="btn-attach" for="file-inp" title="Send a photo">📷</label>
+    <input type="file" id="file-inp" multiple accept="image/*" style="display:none">
     <button id="mic-btn" onclick="doMic()" title="Voice command">🎤</button>
     <button class="btn btn-wake" id="wake" onclick="doWake()">WAKE</button>
     <button class="btn btn-send" onclick="doSend()">SEND</button>
@@ -275,9 +283,34 @@
       return (bytes / 1024 ** 3).toFixed(2) + ' GB';
     }
 
+    function _isPhoto(file) {
+      if (file.type && file.type.startsWith('image/')) return true;
+      const ext = (file.name.split('.').pop() || '').toLowerCase();
+      return ['jpg','jpeg','png','gif','webp','heic','heif','avif','bmp'].includes(ext);
+    }
+
     // ── File upload (phone → computer) ────────────────────────────────────────
     function _uploadFile(file) {
       const id = 'fc_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      const photo = _isPhoto(file);
+      if (photo) {
+        const card = document.createElement('div');
+        card.className = 'msg-photo';
+        card.id = id;
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(file);
+        img.alt = file.name;
+        card.appendChild(img);
+        const lbl = document.createElement('div');
+        lbl.className = 'fc-lbl';
+        lbl.id = id + '_lbl';
+        lbl.textContent = 'Sending';
+        card.appendChild(lbl);
+        feed.appendChild(card);
+        feed.scrollTop = feed.scrollHeight;
+        _postFile(file, id, card, true);
+        return;
+      }
 
       // Create file card in feed
       const card = document.createElement('div');
@@ -316,14 +349,21 @@
         const lbl  = card.querySelector('.fc-lbl');
         if (xhr.status === 200) {
           let savedName = file.name;
-          try { savedName = JSON.parse(xhr.responseText).name || file.name; } catch {}
-          const dlUrl = `/uploads/${encodeURIComponent(savedName)}?token=${encodeURIComponent(_authToken)}`;
+          let isPhoto = false;
+          try {
+            const body = JSON.parse(xhr.responseText);
+            savedName = body.name || file.name;
+            isPhoto = !!body.photo;
+          } catch {}
           if (bar)  { bar.style.width = '100%'; bar.style.background = 'var(--green)'; }
           if (st)   { st.textContent = '✓'; st.className = 'fc-status done'; }
-          if (lbl)  lbl.textContent = 'Sent';
-          if (meta) meta.insertAdjacentHTML('beforeend',
-            `<a class="fc-dl" href="${dlUrl}" download="${esc(savedName)}">⬇ Download back</a>`);
-          toast('File sent!');
+          if (lbl)  lbl.textContent = isPhoto ? 'Given to Jarvis' : 'Sent';
+          if (!isPhoto && meta) {
+            const dlUrl = `/uploads/${encodeURIComponent(savedName)}?token=${encodeURIComponent(_authToken)}`;
+            meta.insertAdjacentHTML('beforeend',
+              `<a class="fc-dl" href="${dlUrl}" download="${esc(savedName)}">⬇ Download back</a>`);
+          }
+          toast(isPhoto ? 'Photo given to Jarvis' : 'File sent!');
         } else {
           let errMsg = 'Upload failed';
           try { errMsg = JSON.parse(xhr.responseText).error || errMsg; } catch {}
@@ -345,9 +385,48 @@
       xhr.send(fd);
     }
 
+    function _postFile(file, id, card, photo) {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/upload');
+      xhr.setRequestHeader('Authorization', `Bearer ${_authToken}`);
+      xhr.onload = () => {
+        const lbl = document.getElementById(id + '_lbl');
+        if (xhr.status === 200) {
+          if (lbl) lbl.textContent = photo ? 'Given to Jarvis' : 'Sent';
+          toast(photo ? 'Photo given to Jarvis' : 'File sent!');
+        } else {
+          let errMsg = 'Upload failed';
+          try { errMsg = JSON.parse(xhr.responseText).error || errMsg; } catch {}
+          if (lbl) lbl.textContent = errMsg;
+        }
+      };
+      xhr.onerror = () => {
+        const lbl = document.getElementById(id + '_lbl');
+        if (lbl) lbl.textContent = 'Connection error';
+      };
+      const fd = new FormData();
+      fd.append('file', file);
+      xhr.send(fd);
+    }
+
     // File received by another WebSocket client (e.g., second open tab)
     function _onFileReceived(m) {
       const dlUrl = `/uploads/${encodeURIComponent(m.name)}?token=${encodeURIComponent(_authToken)}`;
+      if (m.photo) {
+        const card = document.createElement('div');
+        card.className = 'msg-photo';
+        const img = document.createElement('img');
+        img.src = dlUrl;
+        img.alt = m.name;
+        card.appendChild(img);
+        const lbl = document.createElement('div');
+        lbl.className = 'fc-lbl';
+        lbl.textContent = 'Given to Jarvis';
+        card.appendChild(lbl);
+        feed.appendChild(card);
+        feed.scrollTop = feed.scrollHeight;
+        return;
+      }
       const card  = document.createElement('div');
       card.className = 'msg-file';
       card.innerHTML = `

@@ -8,6 +8,7 @@ touching the window.
 import threading
 
 _hold = threading.Event()
+_on_end: list = []
 
 
 def active() -> bool:
@@ -18,5 +19,19 @@ def begin() -> None:
     _hold.set()
 
 
+def on_end(fn) -> None:
+    """Run fn on the thread that clears the hold, once, when a call finishes."""
+    if fn not in _on_end:
+        _on_end.append(fn)
+
+
 def end() -> None:
+    was = _hold.is_set()
     _hold.clear()
+    if not was:
+        return
+    for fn in list(_on_end):
+        try:
+            fn()
+        except Exception:
+            pass

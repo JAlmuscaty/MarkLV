@@ -24,8 +24,34 @@ if _platform.system() == "Windows":
 # nothing and makes the app launch the same way in every locale.
 import sys as _sys
 
+
+class _SilentStream:
+    """Stand-in for the console pythonw does not have.
+
+    The desktop and Start menu shortcuts launch Jarvis with pythonw, so
+    sys.stdout and sys.stderr are None. Uvicorn decides whether to color its
+    log by calling stdout.isatty() while building the phone server. That call
+    raises, the server task dies, and the phone tunnel is left with nothing
+    to forward to — which is the 502.
+    """
+
+    def write(self, text):
+        return 0
+
+    def flush(self):
+        return None
+
+    def isatty(self):
+        return False
+
+    def reconfigure(self, **kwargs):
+        return None
+
+
 for _stream in ("stdout", "stderr"):
     try:
+        if getattr(_sys, _stream, None) is None:
+            setattr(_sys, _stream, _SilentStream())
         _s = getattr(_sys, _stream, None)
         if _s is not None and hasattr(_s, "reconfigure"):
             _s.reconfigure(encoding="utf-8", errors="replace")
@@ -280,6 +306,33 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
             "- You hear nothing while the microphone is muted, and you cannot "
             "unmute it yourself.")
     return "\n".join(out)
+
+
+def _phone_link_context() -> str:
+    """The address that is live for this run, read when the session starts.
+
+    The tunnel can still be coming up at that moment. phone_link is what
+    answers a later question with the address written after this prompt.
+    """
+    try:
+        from plugins.phone_link import current_link
+        url, _password = current_link()
+    except Exception:
+        url = ""
+    if not url:
+        return (
+            "[PHONE LINK]\n"
+            "The phone address is not ready yet. When the user asks for the "
+            "link to open Jarvis on their phone, call phone_link and say the "
+            "address it returns. Never guess a trycloudflare address.\n\n"
+        )
+    return (
+        "[PHONE LINK]\n"
+        f"The address to open Jarvis on a phone right now is {url}. "
+        "It changes every time Jarvis starts. When the user asks for that "
+        "link, say this exact address. If you are not sure it is still the "
+        "current one, call phone_link and say what it returns.\n\n"
+    )
 
 
 def _render_prompt(template: str, values: dict) -> str:
@@ -706,10 +759,24 @@ class JarvisLive:
         self.ui.set_state("SLEEPING")
         self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
 
+    def _call_finished(self) -> None:
+        """The WhatsApp call ended. Listen again, and do not fall asleep from it."""
+        self._last_user_speech = time.monotonic()
+        if not self._awake:
+            self.wake(reason="the call ended")
+            return
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
+
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (wake-word mode only)."""
         while True:
             await asyncio.sleep(5)
+            # A call is quiet on purpose. That silence must not count, or he
+            # falls asleep the moment the other person hangs up.
+            if call_hold.active():
+                self._last_user_speech = time.monotonic()
+                continue
             if not self._wake_enabled or not self._awake:
                 continue
             with self._speaking_lock:
@@ -1025,7 +1092,7 @@ class JarvisLive:
             ),
         })
 
-        parts = [time_ctx, identity_ctx]
+        parts = [time_ctx, identity_ctx, _phone_link_context()]
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
@@ -1276,7 +1343,9 @@ class JarvisLive:
             traceback.print_exc()
             self.speak_error(name, e)
 
-        if not self.ui.muted and not call_hold.active():
+        if call_hold.active():
+            self.ui.set_state("ON CALL")
+        elif not self.ui.muted:
             self.ui.set_state("LISTENING")
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
@@ -1319,6 +1388,13 @@ class JarvisLive:
             # A WhatsApp call owns the room. Nothing is streamed, and the wake
             # word stays off, until the call window is gone.
             if call_hold.active():
+                # The call is not sent to Gemini. The wake word still has to
+                # hear, or "Hey Jarvis" does nothing once the call has ended
+                # and he has gone to sleep.
+                if self._wake_enabled and not self._awake:
+                    det = self._wake_detector
+                    if det is not None:
+                        det.feed(indata)
                 return
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
@@ -2039,6 +2115,39 @@ class JarvisLive:
                 except asyncio.QueueFull:
                     pass
 
+    async def _send_phone_photo(self, item: dict) -> None:
+        """Hand the phone's picture to the live session. No download step."""
+        import base64 as _b64
+
+        path = str(item.get("path") or "")
+        name = str(item.get("name") or "photo")
+        data = item.get("data") or b""
+        try:
+            self.ui.note_phone_photo(path)
+        except Exception:
+            pass
+        if not self.session or not data:
+            print(f"[Phone] Dropped photo {name} (no session).")
+            return
+        if self._wake_enabled and not self._awake:
+            self.wake(reason="phone photo")
+        b64 = _b64.b64encode(data).decode("ascii")
+        print(f"[Phone] Photo {name} ({len(data):,} bytes) → session")
+        self.ui.write_log(f"FILE: {name} from the phone")
+        await self.session.send_client_content(
+            turns={"role": "user", "parts": [
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                {"text": (
+                    "[IMAGE SOURCE: PHONE PHOTO]\n"
+                    f"The user just sent this picture from their phone. "
+                    f"The file is '{name}'. Look at the picture itself. "
+                    f"Say that you have it, and ask what they want done with it. "
+                    f"Do not ask them to download it or send it again."
+                )},
+            ]},
+            turn_complete=True,
+        )
+
     def _on_phone_connected(self) -> None:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
         self.ui.notify_phone_connected()
@@ -2058,6 +2167,9 @@ class JarvisLive:
                     if self.session:
                         break
                     await asyncio.sleep(0.1)
+                if isinstance(text, dict) and text.get("kind") == "photo":
+                    await self._send_phone_photo(text)
+                    continue
                 if self.session:
                     # A remote command is deliberate control and the phone user
                     # has no desktop WAKE button — so it wakes JARVIS if asleep.
@@ -2081,6 +2193,7 @@ class JarvisLive:
     async def run(self):
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
+        call_hold.on_end(self._call_finished)
 
         # ── Wire the shared core services to the interface ───────────────────
         # The confirmation gate is useless without a way to ask, and a memory

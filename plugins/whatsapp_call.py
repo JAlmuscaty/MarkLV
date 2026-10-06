@@ -16,9 +16,15 @@ PLUGIN = {
         "an incoming WhatsApp voice or video call, or decline and tell that "
         "person they are busy and will call later. "
         "action='call' clicks the voice call icon in that person's chat. "
-        "action='decline' clicks Decline on an incoming voice or video call. "
-        "action='decline_and_message' declines, then sends a message that the "
-        "user is busy and will call later. "
+        "action='decline' clicks Decline on the incoming voice or video call that "
+        "is ringing right now. "
+        "action='decline_all' keeps declining every incoming WhatsApp voice or "
+        "video call until the user says to stop. Use this when they say decline "
+        "all incoming calls, reject every call, or don't answer calls. "
+        "action='allow_calls' stops that. Use it when they say to take calls "
+        "again or stop declining. "
+        "action='decline_and_message' declines the call that is ringing, then "
+        "sends a message that the user is busy and will call later. "
         "Pass the contact name in 'contact'. During an outgoing call Jarvis stays "
         "silent until the call ends; do not keep talking after you start it."
     ),
@@ -27,7 +33,7 @@ PLUGIN = {
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "call | decline | decline_and_message",
+                "description": "call | decline | decline_all | allow_calls | decline_and_message",
             },
             "contact": {
                 "type": "STRING",
@@ -41,7 +47,6 @@ PLUGIN = {
         "required": ["action"],
     },
     "behavior": "NON_BLOCKING",
-    "scheduling": "SILENT",
 }
 
 _BUSY = "I'm busy right now. I'll call you later."
@@ -58,20 +63,8 @@ def _quiet(player) -> None:
         pass
 
 
-def _call_live(app) -> bool:
-    try:
-        if app.call_in_progress():
-            return True
-    except Exception:
-        return False
-    try:
-        return app.screen_says_call()
-    except Exception:
-        return False
-
-
 def _watch_until_call_ends() -> None:
-    """Drop the silence once the call is no longer on screen or on the audio device."""
+    """Drop the silence once the call is gone, even if WhatsApp's audio stays open."""
     from core import call_hold
     from plugins import _whatsapp_core as wa
 
@@ -82,7 +75,6 @@ def _watch_until_call_ends() -> None:
         return
 
     # The ring needs a moment to appear. If it never does, don't stay mute.
-    # The picture of the window is only taken once, on the last try.
     seen = False
     for attempt in range(8):
         time_sleep(1.0)
@@ -103,25 +95,112 @@ def _watch_until_call_ends() -> None:
         return
 
     quiet_passes = 0
-    for _ in range(3600):
+    audio_only = 0
+    for _ in range(7200):
         time_sleep(1.0)
-        # A picture of the window is the slow check, so only take one after the
-        # window and the audio device have both gone quiet for a few seconds.
         try:
-            live = app.call_in_progress()
+            on_screen = app.ui_says_call()
         except Exception:
-            live = False
-        if live:
+            on_screen = False
+        try:
+            audible = app.call_in_progress()
+        except Exception:
+            audible = False
+        if on_screen:
             quiet_passes = 0
+            audio_only = 0
+            continue
+        if audible:
+            quiet_passes = 0
+            audio_only += 1
+            # Audio alone can stick after hang-up. Look at the window before
+            # staying silent for the rest of the evening.
+            if audio_only >= 12:
+                audio_only = 0
+                try:
+                    if not app.screen_says_call():
+                        break
+                except Exception:
+                    break
             continue
         quiet_passes += 1
-        if quiet_passes < 4:
-            continue
-        if _call_live(app):
-            quiet_passes = 0
-            continue
-        break
+        if quiet_passes >= 3:
+            break
     call_hold.end()
+
+
+_DECLINE_ALL = threading.Event()
+_DECLINE_THREAD: threading.Thread | None = None
+_DECLINE_LOCK = threading.Lock()
+
+
+def _decline_flag():
+    from core.drive_scope import save_dir
+    return save_dir() / "decline_incoming_calls.txt"
+
+
+def _ensure_decline_thread() -> None:
+    global _DECLINE_THREAD
+    with _DECLINE_LOCK:
+        if _DECLINE_THREAD is not None and _DECLINE_THREAD.is_alive():
+            return
+        _DECLINE_THREAD = threading.Thread(
+            target=_decline_all_loop, daemon=True, name="whatsapp-decline-all"
+        )
+        _DECLINE_THREAD.start()
+
+
+def _set_decline_all(on: bool) -> None:
+    path = _decline_flag()
+    if on:
+        path.write_text("on", encoding="utf-8")
+        _DECLINE_ALL.set()
+        _ensure_decline_thread()
+        return
+    _DECLINE_ALL.clear()
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _decline_all_loop() -> None:
+    """Click Decline on every incoming WhatsApp call until the mode is turned off."""
+    from core import call_hold
+    from plugins import _whatsapp_core as wa
+
+    since_look = 999.0
+    while _DECLINE_ALL.is_set():
+        time_sleep(0.8)
+        since_look += 0.8
+        if not _DECLINE_ALL.is_set() or call_hold.active():
+            continue
+        try:
+            app = wa.WhatsApp()
+            if app.click_decline():
+                since_look = 0.0
+                continue
+            # The button is often inside the page, not named. A ringing
+            # WhatsApp is the cue to look for Decline, and not more often
+            # than every few seconds.
+            if since_look < 6.0 or not app._whatsapp_audio_active():
+                continue
+            since_look = 0.0
+            app.decline_incoming()
+        except Exception:
+            continue
+
+
+def _restore_decline_all() -> None:
+    try:
+        if _decline_flag().is_file():
+            _DECLINE_ALL.set()
+            _ensure_decline_thread()
+    except Exception:
+        pass
+
+
+_restore_decline_all()
 
 
 def time_sleep(seconds: float) -> None:
@@ -132,9 +211,21 @@ def time_sleep(seconds: float) -> None:
 def run(parameters: dict, player=None, session_memory=None) -> str:
     from plugins import _whatsapp_core as wa
 
-    action = str(parameters.get("action") or "").strip().lower().replace("-", "_")
+    action = str(parameters.get("action") or "").strip().lower().replace("-", "_").replace(" ", "_")
     contact = str(parameters.get("contact") or "").strip()
     message = str(parameters.get("message") or "").strip() or _BUSY
+    if parameters.get("all") in (True, "true", "True", "yes", "all"):
+        action = "decline_all"
+
+    if action in ("decline_all", "auto_decline", "reject_all", "decline_every"):
+        _set_decline_all(True)
+        return (
+            "I will decline every incoming WhatsApp voice or video call "
+            "until you tell me to stop."
+        )
+    if action in ("allow_calls", "stop_declining", "take_calls"):
+        _set_decline_all(False)
+        return "I will let incoming WhatsApp calls through again."
 
     try:
         app = wa.WhatsApp()

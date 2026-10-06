@@ -17,8 +17,28 @@ import re
 import secrets
 import socket
 import string
+import sys
 import time
 from pathlib import Path
+
+
+class _SilentStream:
+    """Used when Jarvis was started with pythonw and has no console."""
+
+    def write(self, text):
+        return 0
+
+    def flush(self):
+        return None
+
+    def isatty(self):
+        return False
+
+
+if sys.stdout is None:
+    sys.stdout = _SilentStream()
+if sys.stderr is None:
+    sys.stderr = _SilentStream()
 
 _DEPS_OK = False
 try:
@@ -862,6 +882,24 @@ class DashboardServer:
             name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(". ")
             return name or "upload"
 
+        def _photo_jpeg(path: Path) -> bytes | None:
+            """The picture itself, small enough to hand to Jarvis. None if it is not a photo."""
+            if path.suffix.lower() not in {
+                ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".avif",
+            }:
+                return None
+            try:
+                import io
+                from PIL import Image
+                with Image.open(path) as img:
+                    img = img.convert("RGB")
+                    img.thumbnail((1600, 1600))
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    return buf.getvalue()
+            except Exception:
+                return None
+
         if _UPLOAD_OK:
             @app.post("/api/upload")
             async def upload_file(req: Request, file: UploadFile = FastAPIFile(...)):
@@ -900,13 +938,30 @@ class DashboardServer:
                         pass
                     return JSONResponse({"error": str(exc)}, status_code=500)
 
+                photo = _photo_jpeg(dest)
+                if photo:
+                    await self._command_queue.put({
+                        "kind": "photo",
+                        "path": str(dest),
+                        "name": dest.name,
+                        "data": photo,
+                    })
+                else:
+                    await self._command_queue.put(
+                        f"[FILE_UPLOADED] path={dest} | name={dest.name} | "
+                        f"size={size} | The user sent this file from their phone. "
+                        f"Tell them you have it and ask what they want done with it."
+                    )
                 asyncio.create_task(self.broadcast({
                     "type": "file_received",
                     "name": dest.name,
                     "size": size,
                     "saved_to": str(self._uploads_dir),
+                    "photo": photo is not None,
                 }))
-                return JSONResponse({"ok": True, "name": dest.name, "size": size})
+                return JSONResponse({
+                    "ok": True, "name": dest.name, "size": size, "photo": photo is not None,
+                })
         else:
             @app.post("/api/upload")
             async def upload_unavailable(req: Request):
@@ -941,7 +996,14 @@ class DashboardServer:
             path = self._uploads_dir / safe
             if not path.exists() or not path.is_file():
                 return JSONResponse({"error": "Not found"}, status_code=404)
-            return FileResponse(str(path), filename=safe)
+            image = path.suffix.lower() in {
+                ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".avif",
+            }
+            return FileResponse(
+                str(path),
+                filename=safe,
+                content_disposition_type="inline" if image else "attachment",
+            )
 
         @app.websocket("/ws")
         async def ws_ep(websocket: WebSocket, token: str = ""):
@@ -1068,6 +1130,7 @@ class DashboardServer:
         asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
+            use_colors=False,
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
         )
         print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
@@ -1100,6 +1163,7 @@ class DashboardServer:
 
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT, log_level="warning",
+            use_colors=False,
             **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
         )
 
@@ -1121,5 +1185,6 @@ class DashboardServer:
     async def _serve_local(self) -> None:
         cfg = uvicorn.Config(
             self.app, host="127.0.0.1", port=LOCAL_PORT, log_level="warning",
+            use_colors=False,
         )
         await self._serve_safe(cfg, "local phone port")

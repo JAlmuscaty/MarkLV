@@ -2978,6 +2978,7 @@ class MainWindow(QMainWindow):
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
     _phone_sig      = pyqtSignal()           # phone connected — never touch widgets off the UI thread
+    _phone_file_sig = pyqtSignal(str)        # a photo path from the phone page
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -3262,6 +3263,7 @@ class MainWindow(QMainWindow):
         self._quiz_hide_sig.connect(self._hide_quiz)
         self._review_sig.connect(self._show_review)
         self._phone_sig.connect(self._on_phone_connected_ui)
+        self._phone_file_sig.connect(self._on_phone_photo_ui)
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -4944,6 +4946,27 @@ class MainWindow(QMainWindow):
     def notify_phone_connected(self) -> None:
         self._phone_sig.emit()
 
+    def note_phone_photo(self, path: str) -> None:
+        """Remember a picture sent from the phone. Safe to call off the UI thread."""
+        if path:
+            self._phone_file_sig.emit(path)
+
+    def _on_phone_photo_ui(self, path: str) -> None:
+        if not is_allowed(path):
+            return
+        zone = self._drop_zone
+        zone._current_file = path
+        zone._canvas.update()
+        p = Path(path)
+        try:
+            size = _fmt_size(p.stat().st_size)
+        except Exception:
+            size = ""
+        self._file_hint.setText(
+            f"🖼️  {p.name}  ·  {size}  ·  From the phone — tell {self._assistant_name} what to do"
+        )
+        self._log.append_log(f"FILE: {p.name} from the phone")
+
     def _on_phone_connected_ui(self) -> None:
         if self._remote_overlay and self._remote_overlay.isVisible():
             self._remote_overlay.mark_connected()
@@ -5780,6 +5803,9 @@ class JarvisUI:
 
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
+
+    def note_phone_photo(self, path: str) -> None:
+        self._win.note_phone_photo(path)
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
