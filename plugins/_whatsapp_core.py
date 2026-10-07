@@ -364,33 +364,89 @@ class WhatsApp:
         )
         return bool(data and data.get("calling") is True)
 
-    def _ask_window(self, win, prompt: str) -> dict | None:
-        import io
+    def look_for_decline(self) -> bool:
+        """Look at the screen and click Decline if a call is ringing.
 
-        from google.genai import types
+        This does not care whether Jarvis is muted. It is how a standing
+        'decline incoming calls' order keeps working after the ask.
+        """
+        if self.click_decline():
+            return True
+        prompt = (
+            "Is an incoming WhatsApp voice or video call ringing on this screen "
+            "(a Decline, Reject, or Reddet button, not a call already connected)? "
+            "If it is ringing, reply with JSON only: "
+            '{"found": true, "x": <pixels from the left of this image>, '
+            '"y": <pixels from the top of this image>} for the center of Decline. '
+            'If nobody is calling, reply {"found": false}.'
+        )
+        data = self._ask_screen(prompt)
+        if not data or not data.get("found"):
+            return False
+        scale = getattr(self, "_last_scale", None)
+        if scale is None:
+            return False
+        left, top, scale_x, scale_y, shown_size = scale
+        try:
+            x = int(data["x"])
+            y = int(data["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not (0 <= x <= shown_size[0] and 0 <= y <= shown_size[1]):
+            return False
+        self._click_screen(int(left + x * scale_x), int(top + y * scale_y))
+        return True
+
+    def _ask_screen(self, prompt: str) -> dict | None:
+        """Read the whole screen. A covered or minimized WhatsApp window still shows its call banner here."""
         from PIL import ImageGrab
 
-        from core import gemini
+        try:
+            image = ImageGrab.grab(all_screens=True)
+        except TypeError:
+            image = ImageGrab.grab()
+        except Exception:
+            return None
+        origin = (0, 0)
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            origin = (int(user32.GetSystemMetrics(76)), int(user32.GetSystemMetrics(77)))
+        except Exception:
+            pass
+        return self._ask_image(image, prompt, origin=origin)
+
+    def _ask_window(self, win, prompt: str) -> dict | None:
+        from PIL import ImageGrab
 
         try:
             rect = win.rectangle()
             image = ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom))
         except Exception:
             return None
+        return self._ask_image(image, prompt, origin=(rect.left, rect.top))
+
+    def _ask_image(self, image, prompt: str, origin: tuple[int, int]) -> dict | None:
+        import io
+
+        from google.genai import types
+
+        from core import gemini
+
         shown = image.copy()
         shown.thumbnail((1280, 800))
         self._last_scale = (
-            rect.left,
-            rect.top,
+            origin[0],
+            origin[1],
             image.size[0] / shown.size[0],
             image.size[1] / shown.size[1],
             shown.size,
         )
         buf = io.BytesIO()
-        shown.convert("RGB").save(buf, format="JPEG", quality=85)
+        shown.convert("RGB").save(buf, format="JPEG", quality=80)
         part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
         try:
-            reply = gemini.call([prompt, part], tier=gemini.SMART, timeout_ms=40_000)
+            reply = gemini.call([prompt, part], tier=gemini.SMART, timeout_ms=18_000)
         except Exception:
             return None
         raw = (getattr(reply, "text", None) or "").strip()

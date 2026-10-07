@@ -18,9 +18,11 @@ PLUGIN = {
         "action='call' clicks the voice call icon in that person's chat. "
         "action='decline' clicks Decline on the incoming voice or video call that "
         "is ringing right now. "
-        "action='decline_all' keeps declining every incoming WhatsApp voice or "
-        "video call until the user says to stop. Use this when they say decline "
-        "all incoming calls, reject every call, or don't answer calls. "
+        "action='decline_all' arms continuous watching. Use it as soon as the user "
+        "says to decline incoming calls, reject every call, or don't answer "
+        "calls — even if nobody is ringing at that moment, and even if Jarvis "
+        "is muted. He keeps looking at the screen and declines each new call "
+        "until they say to stop. Do not wait for a call to be ringing. "
         "action='allow_calls' stops that. Use it when they say to take calls "
         "again or stop declining. "
         "action='decline_and_message' declines the call that is ringing, then "
@@ -165,30 +167,23 @@ def _set_decline_all(on: bool) -> None:
 
 
 def _decline_all_loop() -> None:
-    """Click Decline on every incoming WhatsApp call until the mode is turned off."""
+    """Keep looking at the screen and decline each incoming call.
+
+    Mute does not stop this. A call does not have to be ringing when the
+    order is given; the next one is declined when it appears.
+    """
     from core import call_hold
     from plugins import _whatsapp_core as wa
 
-    since_look = 999.0
     while _DECLINE_ALL.is_set():
-        time_sleep(0.8)
-        since_look += 0.8
-        if not _DECLINE_ALL.is_set() or call_hold.active():
+        if call_hold.active():
+            time_sleep(1.0)
             continue
         try:
-            app = wa.WhatsApp()
-            if app.click_decline():
-                since_look = 0.0
-                continue
-            # The button is often inside the page, not named. A ringing
-            # WhatsApp is the cue to look for Decline, and not more often
-            # than every few seconds.
-            if since_look < 6.0 or not app._whatsapp_audio_active():
-                continue
-            since_look = 0.0
-            app.decline_incoming()
+            wa.WhatsApp().look_for_decline()
         except Exception:
-            continue
+            pass
+        time_sleep(1.5)
 
 
 def _restore_decline_all() -> None:
@@ -220,8 +215,9 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     if action in ("decline_all", "auto_decline", "reject_all", "decline_every"):
         _set_decline_all(True)
         return (
-            "I will decline every incoming WhatsApp voice or video call "
-            "until you tell me to stop."
+            "I am watching the screen. I will decline every incoming WhatsApp "
+            "voice or video call, including while muted, until you tell me to stop. "
+            "A call does not need to be ringing now."
         )
     if action in ("allow_calls", "stop_declining", "take_calls"):
         _set_decline_all(False)

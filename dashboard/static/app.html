@@ -112,6 +112,11 @@
     }
     .btn-attach:hover  { opacity: 0.82; border-color: var(--accent); color: var(--accent); }
     .btn-attach:active { transform: scale(0.96); }
+    /* Hidden, but not display:none — iOS will not open the photo picker otherwise. */
+    #file-inp {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0,0,0,0); border: 0; opacity: 0;
+    }
 
     /* ── MIC BUTTON ── */
     #mic-btn {
@@ -154,7 +159,7 @@
   <footer>
     <input id="inp" placeholder="Send a command to JARVIS…" autocomplete="off">
     <label class="btn-attach" for="file-inp" title="Send a photo">📷</label>
-    <input type="file" id="file-inp" multiple accept="image/*" style="display:none">
+    <input type="file" id="file-inp" multiple accept="image/*">
     <button id="mic-btn" onclick="doMic()" title="Voice command">🎤</button>
     <button class="btn btn-wake" id="wake" onclick="doWake()">WAKE</button>
     <button class="btn btn-send" onclick="doSend()">SEND</button>
@@ -231,11 +236,10 @@
     };
 
     function setStatus(s) {
-      if (s === 'active') {
-        pill.className = 'pill on'; stTxt.textContent = 'Active'; wake.classList.remove('show');
-      } else {
-        pill.className = 'pill'; stTxt.textContent = 'Sleeping'; wake.classList.add('show');
-      }
+      // The phone is never asleep. Desktop wake-word sleep does not apply here.
+      pill.className = 'pill on';
+      stTxt.textContent = 'Active';
+      wake.classList.remove('show');
     }
 
     function append(speaker, text) {
@@ -287,6 +291,27 @@
       if (file.type && file.type.startsWith('image/')) return true;
       const ext = (file.name.split('.').pop() || '').toLowerCase();
       return ['jpg','jpeg','png','gif','webp','heic','heif','avif','bmp'].includes(ext);
+    }
+
+    // Phones hand over huge HEIC files. Decode here and send a small JPEG,
+    // which is what actually arrives.
+    async function _asJpeg(file) {
+      try {
+        const bmp = await createImageBitmap(file);
+        const max = 1600;
+        const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
+        const w = Math.max(1, Math.round(bmp.width * scale));
+        const h = Math.max(1, Math.round(bmp.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(bmp, 0, 0, w, h);
+        if (bmp.close) bmp.close();
+        const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+        if (!blob) return file;
+        return new File([blob], 'photo.jpg', { type: 'image/jpeg' });
+      } catch (_) {
+        return file;
+      }
     }
 
     // ── File upload (phone → computer) ────────────────────────────────────────
@@ -446,8 +471,12 @@
 
     // File input change handler
     document.getElementById('file-inp').addEventListener('change', function () {
-      Array.from(this.files).forEach(_uploadFile);
-      this.value = ''; // reset so the same file can be re-sent
+      const files = Array.from(this.files);
+      this.value = ''; // reset so the same photo can be sent again
+      files.forEach(async (file) => {
+        if (_isPhoto(file)) file = await _asJpeg(file);
+        _uploadFile(file);
+      });
     });
 
     // ── Commands ──────────────────────────────────────────────────────────────
@@ -463,7 +492,9 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
-      });
+      }).then(r => {
+        if (!r.ok) sys('That did not reach Jarvis. Open the link again and sign in.');
+      }).catch(() => sys('That did not reach Jarvis.'));
     }
 
     function doWake() {
@@ -490,6 +521,7 @@
     let _audioCtx = null;
     let _micStm   = null;
     let _audioNd  = null;
+    let _audioSink = null;
 
     function _micIdle() {
       micBtn.innerHTML = '🎤';
@@ -548,23 +580,26 @@
         _showVoiceSetup();
         return;
       }
+      // Create the audio clock in this tap, before any wait. Resuming it
+      // after the socket opens is no longer a user gesture, so the phone
+      // stays silent and nothing is sent.
+      let ctx;
+      try { ctx = new AudioContext({ sampleRate: 16000 }); }
+      catch (_) { ctx = new AudioContext(); }
+      const resumed = ctx.resume();
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
         });
+        await resumed;
       } catch (e) {
+        try { ctx.close(); } catch (_) {}
         sys(e.name === 'NotAllowedError'
           ? 'Microphone denied — tap the address bar lock and allow microphone.'
           : 'Mic error: ' + e.message);
         return;
       }
-
-      // 16 kHz context (fall back to native rate — _f32toPcm16 resamples)
-      let ctx;
-      try { ctx = new AudioContext({ sampleRate: 16000 }); }
-      catch (_) { ctx = new AudioContext(); }
-      if (ctx.state === 'suspended') await ctx.resume();
 
       const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
       const ws = new WebSocket(
@@ -596,16 +631,28 @@
               _pbuf = []; _plen = 0;
             }
           };
+          // The worklet does not run unless the graph reaches the speakers.
+          // Gain 0 pulls the mic without playing it back into the phone.
+          const sink = ctx.createGain();
+          sink.gain.value = 0;
           src.connect(nd);
+          nd.connect(sink);
+          sink.connect(ctx.destination);
           _audioNd = nd;
+          _audioSink = sink;
         } catch (_) {
           // ScriptProcessor fallback (deprecated, still works everywhere)
           const sp = ctx.createScriptProcessor(4096, 1, 1);
           sp.onaudioprocess = e => {
             if (ws.readyState === 1) ws.send(_f32toPcm16(e.inputBuffer.getChannelData(0), rate));
           };
-          src.connect(sp); sp.connect(ctx.destination);
+          const sink = ctx.createGain();
+          sink.gain.value = 0;
+          src.connect(sp);
+          sp.connect(sink);
+          sink.connect(ctx.destination);
           _audioNd = sp;
+          _audioSink = sink;
         }
 
         micBtn.innerHTML = '⏹';
@@ -625,6 +672,7 @@
 
     function _stopVoice() {
       if (_audioNd)  { try { _audioNd.disconnect(); }  catch (_) {}; _audioNd  = null; }
+      if (_audioSink){ try { _audioSink.disconnect(); } catch (_) {}; _audioSink = null; }
       if (_audioCtx) { try { _audioCtx.close(); }      catch (_) {}; _audioCtx = null; }
       if (_micStm)   { _micStm.getTracks().forEach(t => t.stop()); _micStm = null; }
       if (_voiceWs)  {

@@ -587,6 +587,7 @@ class DashboardServer:
         self._command_queue               = asyncio.Queue()
         self._wake_callback               = None
         self._connect_callback            = None
+        self._phone_page_callback         = None
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
@@ -643,6 +644,13 @@ class DashboardServer:
 
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
+
+    def set_phone_page_callback(self, fn) -> None:
+        """Called when the phone page's live connection opens."""
+        self._phone_page_callback = fn
+
+    def phone_page_open(self) -> bool:
+        return bool(self._clients)
 
     # ── broadcast ────────────────────────────────────────────────────────
 
@@ -709,7 +717,7 @@ class DashboardServer:
             self._tokens.add(tok)
             self._token_keys[tok] = session_key
             self._aes_key(session_key)
-            body = {"ok": True, "token": tok}
+            body = {"ok": True, "token": tok, "key": session_key}
             if device:
                 dev_tok = secrets.token_urlsafe(32)
                 self._device_sessions[dev_tok] = {"session_key": session_key}
@@ -864,7 +872,7 @@ class DashboardServer:
                     data = await websocket.receive_bytes()
                     try:
                         self._phone_audio_queue.put_nowait(
-                            {"data": data, "mime_type": "audio/pcm"}
+                            {"data": bytes(data), "mime_type": "audio/pcm"}
                         )
                     except asyncio.QueueFull:
                         pass  # drop frame rather than block
@@ -882,9 +890,11 @@ class DashboardServer:
             name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(". ")
             return name or "upload"
 
-        def _photo_jpeg(path: Path) -> bytes | None:
+        def _photo_jpeg(path: Path, content_type: str = "") -> bytes | None:
             """The picture itself, small enough to hand to Jarvis. None if it is not a photo."""
-            if path.suffix.lower() not in {
+            kind = (content_type or "").split(";")[0].strip().lower()
+            suffix = path.suffix.lower()
+            if not kind.startswith("image/") and suffix not in {
                 ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".avif",
             }:
                 return None
@@ -938,7 +948,7 @@ class DashboardServer:
                         pass
                     return JSONResponse({"error": str(exc)}, status_code=500)
 
-                photo = _photo_jpeg(dest)
+                photo = _photo_jpeg(dest, file.content_type or "")
                 if photo:
                     await self._command_queue.put({
                         "kind": "photo",
@@ -1013,6 +1023,15 @@ class DashboardServer:
                 return
             await websocket.accept()
             self._clients.add(websocket)
+            if self._phone_page_callback:
+                try:
+                    self._phone_page_callback()
+                except Exception:
+                    pass
+            try:
+                await websocket.send_json({"type": "status", "state": "active"})
+            except Exception:
+                pass
             for entry in self._history[-50:]:
                 try:
                     await websocket.send_json(entry)

@@ -296,15 +296,19 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
     ]
     if has_vision:
         out.append(
-            "- Your sight is not continuous. You see nothing until you call a "
-            "vision tool, and then only that single frame at that moment — you "
-            "cannot watch, monitor or notice something changing on screen.")
+            "- You do not describe the whole screen all the time. "
+            "whatsapp_call action decline_all is different: once the user asks, "
+            "you keep looking at the screen for incoming WhatsApp calls and "
+            "decline each one, including while your microphone is muted, until "
+            "they tell you to stop. A call does not have to be ringing at the "
+            "moment they ask.")
     else:
         out.append("- You have no sight at all in this build.")
     if has_mic:
         out.append(
-            "- You hear nothing while the microphone is muted, and you cannot "
-            "unmute it yourself.")
+            "- Muting closes the microphone on this PC. It does not stop the phone "
+            "page, and it does not stop you declining incoming calls after the "
+            "user has asked you to. You cannot unmute the PC microphone yourself.")
     return "\n".join(out)
 
 
@@ -751,7 +755,28 @@ class JarvisLive:
             self.ui.set_state("LISTENING")
         self.ui.write_log(f"SYS: Awake — {reason}.")
 
+    def _phone_open(self) -> bool:
+        dash = getattr(self, "_dashboard", None)
+        if dash is None:
+            return False
+        try:
+            return dash.phone_page_open()
+        except Exception:
+            return False
+
+    def _on_phone_page(self) -> None:
+        """The phone page is open. Stay awake for it; the PC may still sleep later."""
+        self._last_user_speech = time.monotonic()
+        if not self._awake:
+            self.wake(reason="phone is open")
+            return
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
+
     def sleep(self, reason: str = "timeout") -> None:
+        if self._phone_open():
+            self._last_user_speech = time.monotonic()
+            return
         if not self._awake:
             return
         self._awake = False
@@ -776,6 +801,12 @@ class JarvisLive:
             # falls asleep the moment the other person hangs up.
             if call_hold.active():
                 self._last_user_speech = time.monotonic()
+                continue
+            # An open phone page stays awake. Closing it lets the PC sleep again.
+            if self._phone_open():
+                self._last_user_speech = time.monotonic()
+                if not self._awake:
+                    self.wake(reason="phone is open")
                 continue
             if not self._wake_enabled or not self._awake:
                 continue
@@ -1373,12 +1404,20 @@ class JarvisLive:
             # mic / phone PCM through the new `audio` field instead. Queue items
             # are {"data": <bytes>, "mime_type": <str>} from _listen_audio and
             # the phone relay.
-            await self.session.send_realtime_input(
-                audio=types.Blob(
-                    data=msg["data"],
-                    mime_type=msg.get("mime_type", "audio/pcm"),
+            data = msg.get("data") if isinstance(msg, dict) else None
+            if not data:
+                continue
+            try:
+                await self.session.send_realtime_input(
+                    audio=types.Blob(
+                        data=data,
+                        mime_type=msg.get("mime_type") or "audio/pcm;rate=16000",
+                    )
                 )
-            )
+            except Exception as e:
+                print(f"[JARVIS] Mic send failed: {e}")
+                self.ui.write_log("ERR: Audio did not reach the session.")
+                raise
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
@@ -2095,24 +2134,42 @@ class JarvisLive:
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
     async def _relay_phone_audio(self) -> None:
-        """Forward phone mic PCM chunks from dashboard queue into the Gemini Live session."""
+        """Forward phone mic PCM into the live session.
+
+        The desktop mute button, wake-word sleep, and Jarvis talking all
+        close the PC microphone. None of those may swallow the phone.
+        """
         q = self._dashboard._phone_audio_queue
+        told = False
         while True:
             try:
                 chunk = await asyncio.wait_for(q.get(), timeout=1.0)
             except asyncio.TimeoutError:
-                # No audio for 1 s → phone mic inactive, give PC mic back
                 self._phone_active = False
+                told = False
                 continue
-            self._phone_active = True   # phone is streaming — silence PC mic
-            if call_hold.active():
+            data = chunk.get("data") if isinstance(chunk, dict) else None
+            if not data or self.out_queue is None:
                 continue
-            with self._speaking_lock:
-                speaking = self._is_speaking
-            if not speaking and not self.ui.muted:
+            self._phone_active = True
+            if self._wake_enabled and not self._awake:
+                self.wake(reason="phone")
+            # Same packaging as the PC microphone, which the session already accepts.
+            try:
+                self.out_queue.put_nowait({
+                    "data": bytes(data),
+                    "mime_type": "audio/pcm",
+                })
+            except asyncio.QueueFull:
+                continue
+            if not told:
+                told = True
+                self.ui.write_log("SYS: Hearing you from the phone.")
                 try:
-                    self.out_queue.put_nowait(chunk)
-                except asyncio.QueueFull:
+                    asyncio.create_task(self._dashboard.broadcast(
+                        {"type": "sys", "text": "Hearing you from the phone."}
+                    ))
+                except Exception:
                     pass
 
     async def _send_phone_photo(self, item: dict) -> None:
@@ -2180,8 +2237,21 @@ class JarvisLive:
                         turn_complete=True,
                     )
                     self.ui.write_log(f"[Web]: {text}")
+                    try:
+                        await self._dashboard.broadcast(
+                            {"type": "sys", "text": "Got your message."}
+                        )
+                    except Exception:
+                        pass
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
+                    try:
+                        await self._dashboard.broadcast({
+                            "type": "sys",
+                            "text": "Jarvis is not connected yet. Send that again in a moment.",
+                        })
+                    except Exception:
+                        pass
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
@@ -2222,6 +2292,7 @@ class JarvisLive:
                 from dashboard.server import DashboardServer
                 self._dashboard = DashboardServer()
                 self._dashboard.set_connect_callback(self._on_phone_connected)
+                self._dashboard.set_phone_page_callback(self._on_phone_page)
                 asyncio.create_task(self._dashboard.serve())
                 asyncio.create_task(self._process_dashboard_commands())
             except Exception as e:
@@ -2229,6 +2300,7 @@ class JarvisLive:
                 self._dashboard = None
         else:
             self._dashboard.set_connect_callback(self._on_phone_connected)
+            self._dashboard.set_phone_page_callback(self._on_phone_page)
             asyncio.create_task(self._process_dashboard_commands())
 
         while True:
